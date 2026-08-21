@@ -12,13 +12,13 @@ python scripts/effect_tokenizer/train_effect_tokenizer.py \
     --sampling-stride 2 \
     --action-dim 7 \
     --shuffle-buffer-size 100000 \
-    --fit-samples 500000 \
+    --fit-samples 5000000 \
     --data-batch-size 4096 \
     --codebook-size 256 \
     --gripper-weight 1.0 \
     --kmeans-max-iterations 50 \
     --kmeans-tolerance 1e-4 \
-    --kmeans-n-init 3 \
+    --kmeans-n-init 5 \
     --seed 42 \
     --log-every-batches 20 \
     --device cuda \
