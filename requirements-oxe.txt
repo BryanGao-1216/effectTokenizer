@@ -1,0 +1,9 @@
+# Matches the versions used by VQ-VLA's RLDS data pipeline.
+# Use Python 3.10 or 3.11; TensorFlow 2.15 does not support newer Python versions.
+tensorflow==2.15.0
+tensorflow-datasets==4.9.3
+tensorflow-graphics==2021.12.3
+dlimp @ git+https://github.com/moojink/dlimp_openvla
+tensorboard
+plotly
+tqdm
