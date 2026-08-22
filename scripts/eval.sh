@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# 10 Hz, chunk length, stride, clipping and pooled normalization are loaded
-# from the checkpoint so evaluation uses the exact training data contract.
+# Frequency, chunking, and per-dataset q01/q99 normalization are loaded from
+# the VQ-VAE checkpoint so evaluation uses the training data contract.
 python scripts/effect_tokenizer/evaluate_effect_tokenizer.py \
-    --checkpoint outputs/effect_tokenizer.pt \
+    --checkpoint outputs/effect_vqvae.pt \
     --data-root-dir /mnt/data27T/media/gwb/datasets/OpenX \
     --test-dataset-name action_tokenizer_plus \
     --output-dir outputs/evaluation \

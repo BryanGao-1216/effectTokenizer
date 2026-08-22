@@ -1,19 +1,20 @@
-"""Core endpoint-effect descriptor and exact Lloyd K-means implementation."""
+"""MLP VQ-VAE for per-dataset-normalized OpenX endpoint effects."""
 
 from __future__ import annotations
 
 import json
-import math
 import random
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import numpy as np
 import torch
+import torch.nn.functional as F
+from torch import Tensor, nn
 
 
-ARTIFACT_VERSION = 1
+ARTIFACT_VERSION = 2
 DESCRIPTOR_NAMES = (
     "delta_x",
     "delta_y",
@@ -30,7 +31,10 @@ def choose_device(device: str) -> torch.device:
         return torch.device(device)
     if torch.cuda.is_available():
         return torch.device("cuda")
-    if getattr(torch.backends, "mps", None) is not None and torch.backends.mps.is_available():
+    if (
+        getattr(torch.backends, "mps", None) is not None
+        and torch.backends.mps.is_available()
+    ):
         return torch.device("mps")
     return torch.device("cpu")
 
@@ -44,16 +48,16 @@ def set_seed(seed: int) -> None:
 
 
 def compute_effect_descriptors(actions: np.ndarray) -> np.ndarray:
-    """Map ``[..., horizon, 7]`` clipped actions to signed 7-D effects.
+    """Convert ``[..., horizon, 7]`` action chunks to signed endpoint effects.
 
-    Translation and rotation are accumulated over the chunk.  Rotation is a
-    first-order sum of the OpenX-standardized small RPY deltas.  Gripper is
-    represented by the final-minus-initial absolute gripper command.
+    Translation and OpenX-standardized RPY deltas are accumulated over the
+    chunk. The gripper effect is the final-minus-initial absolute command.
     """
     values = np.asarray(actions, dtype=np.float32)
-    if values.ndim < 2 or values.shape[-1] != 7:
+    if values.ndim < 2 or values.shape[-1] != len(DESCRIPTOR_NAMES):
         raise ValueError(
-            f"Expected action chunks shaped [..., horizon, 7], got {values.shape}."
+            "Expected action chunks shaped "
+            f"[..., horizon, {len(DESCRIPTOR_NAMES)}], got {values.shape}."
         )
     if values.shape[-2] <= 0:
         raise ValueError("Action chunks must contain at least one timestep.")
@@ -65,316 +69,320 @@ def compute_effect_descriptors(actions: np.ndarray) -> np.ndarray:
     ).astype(np.float32)
 
 
-def fit_global_standardizer(
+def weight_effects(
     descriptors: np.ndarray,
-    *,
-    minimum_scale: float = 1e-6,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Fit one pooled z-score transform after per-source q01/q99 clipping."""
-    values = np.asarray(descriptors, dtype=np.float64)
-    if values.ndim != 2 or values.shape[1] != len(DESCRIPTOR_NAMES):
-        raise ValueError(
-            f"Expected descriptors shaped [N, {len(DESCRIPTOR_NAMES)}], got {values.shape}."
-        )
-    if len(values) == 0:
-        raise ValueError("Cannot fit global normalization on an empty array.")
-    mean = values.mean(axis=0)
-    scale = values.std(axis=0)
-    scale = np.maximum(scale, float(minimum_scale))
-    return mean.astype(np.float32), scale.astype(np.float32)
-
-
-def _standardize(
-    descriptors: np.ndarray,
-    mean: np.ndarray,
-    scale: np.ndarray,
     gripper_weight: float,
 ) -> np.ndarray:
-    values = (
-        np.asarray(descriptors, dtype=np.float32)
-        - np.asarray(mean, dtype=np.float32)
-    ) / np.asarray(scale, dtype=np.float32)
-    values = values.copy()
+    """Apply only the optional gripper weight after per-dataset normalization."""
+    values = np.asarray(descriptors, dtype=np.float32).copy()
     values[..., -1] *= float(gripper_weight)
     return values
 
 
-def _inverse_standardize(
-    descriptors: np.ndarray,
-    mean: np.ndarray,
-    scale: np.ndarray,
+def unweight_effects(
+    weighted: np.ndarray,
     gripper_weight: float,
 ) -> np.ndarray:
-    values = np.asarray(descriptors, dtype=np.float32).copy()
+    values = np.asarray(weighted, dtype=np.float32).copy()
     values[..., -1] /= float(gripper_weight)
-    return values * np.asarray(scale, dtype=np.float32) + np.asarray(
-        mean, dtype=np.float32
-    )
+    return values
 
 
-def _squared_distance(values: torch.Tensor, centers: torch.Tensor) -> torch.Tensor:
+def _squared_distance(values: Tensor, centers: Tensor) -> Tensor:
+    values_float = values.float()
+    centers_float = centers.float()
     return (
-        values.square().sum(dim=-1, keepdim=True)
-        + centers.square().sum(dim=-1).unsqueeze(0)
-        - 2.0 * values @ centers.t()
+        values_float.square().sum(dim=-1, keepdim=True)
+        + centers_float.square().sum(dim=-1).unsqueeze(0)
+        - 2.0 * values_float @ centers_float.t()
     ).clamp_min_(0.0)
 
 
-def _kmeans_plus_plus(
-    values: torch.Tensor,
-    num_clusters: int,
-    *,
-    seed: int,
-    candidate_samples: int,
-) -> torch.Tensor:
-    """K-means++ initialization on all data or an optional candidate subset."""
-    generator = torch.Generator(device=values.device)
-    generator.manual_seed(int(seed))
-    candidate_count = (
-        len(values)
-        if candidate_samples <= 0
-        else min(len(values), max(num_clusters, candidate_samples))
-    )
-    if candidate_count < len(values):
-        indices = torch.randperm(
-            len(values), generator=generator, device=values.device
-        )[:candidate_count]
-        candidates = values[indices]
-    else:
-        candidates = values
+@dataclass(frozen=True)
+class MLPVQVAEConfig:
+    input_dim: int = len(DESCRIPTOR_NAMES)
+    hidden_dim: int = 128
+    latent_dim: int = 16
+    num_hidden_layers: int = 2
+    codebook_size: int = 256
 
-    first = int(
-        torch.randint(
-            len(candidates), (1,), generator=generator, device=values.device
-        ).item()
-    )
-    centers = [candidates[first].clone()]
-    nearest = _squared_distance(candidates, centers[0][None]).squeeze(1)
-    for _ in range(1, num_clusters):
-        total = nearest.sum()
-        if not torch.isfinite(total) or float(total) <= 0.0:
-            selected = int(
-                torch.randint(
-                    len(candidates),
-                    (1,),
-                    generator=generator,
-                    device=values.device,
-                ).item()
+    def __post_init__(self) -> None:
+        for name, value in asdict(self).items():
+            if int(value) <= 0:
+                raise ValueError(f"{name} must be positive, got {value}.")
+        if self.input_dim != len(DESCRIPTOR_NAMES):
+            raise ValueError(
+                f"This effect contract requires input_dim={len(DESCRIPTOR_NAMES)}."
             )
+        if self.codebook_size < 2:
+            raise ValueError("codebook_size must be at least 2.")
+
+    @classmethod
+    def from_dict(cls, values: dict[str, Any]) -> "MLPVQVAEConfig":
+        return cls(**{key: int(value) for key, value in values.items()})
+
+
+def _make_mlp(
+    input_dim: int,
+    output_dim: int,
+    hidden_dim: int,
+    num_hidden_layers: int,
+) -> nn.Sequential:
+    layers: list[nn.Module] = []
+    current_dim = input_dim
+    for _ in range(num_hidden_layers):
+        layers.extend([nn.Linear(current_dim, hidden_dim), nn.GELU()])
+        current_dim = hidden_dim
+    layers.append(nn.Linear(current_dim, output_dim))
+    return nn.Sequential(*layers)
+
+
+@dataclass
+class VQForwardOutput:
+    reconstruction: Tensor
+    encoder_latent: Tensor
+    quantized_latent: Tensor
+    straight_through_latent: Tensor
+    codes: Tensor
+    nearest_squared_distance: Tensor
+    relative_margin: Tensor
+    soft_usage: Tensor
+
+
+class MLPEffectVQVAE(nn.Module):
+    """A single-codebook VQ-VAE over seven-dimensional endpoint effects."""
+
+    def __init__(self, config: MLPVQVAEConfig) -> None:
+        super().__init__()
+        self.config = config
+        self.encoder = _make_mlp(
+            config.input_dim,
+            config.latent_dim,
+            config.hidden_dim,
+            config.num_hidden_layers,
+        )
+        self.codebook = nn.Embedding(config.codebook_size, config.latent_dim)
+        self.decoder = _make_mlp(
+            config.latent_dim,
+            config.input_dim,
+            config.hidden_dim,
+            config.num_hidden_layers,
+        )
+        bound = config.latent_dim**-0.5
+        nn.init.uniform_(self.codebook.weight, -bound, bound)
+
+    @property
+    def codebook_size(self) -> int:
+        return self.config.codebook_size
+
+    def quantize(
+        self,
+        encoder_latent: Tensor,
+        *,
+        usage_temperature: float = 1.0,
+    ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+        if usage_temperature <= 0:
+            raise ValueError("usage_temperature must be positive.")
+        distances = _squared_distance(encoder_latent, self.codebook.weight)
+        nearest, indices = torch.topk(
+            distances,
+            k=min(2, self.codebook_size),
+            largest=False,
+            dim=-1,
+        )
+        codes = indices[:, 0]
+        quantized = F.embedding(codes, self.codebook.weight)
+        if nearest.shape[1] == 1:
+            margin = torch.ones_like(nearest[:, 0])
         else:
-            selected = int(
-                torch.multinomial(
-                    nearest / total,
-                    1,
-                    generator=generator,
-                ).item()
+            margin = (nearest[:, 1] - nearest[:, 0]) / nearest[:, 1].clamp_min(
+                1e-8
             )
-        center = candidates[selected].clone()
-        centers.append(center)
-        nearest = torch.minimum(
-            nearest,
-            _squared_distance(candidates, center[None]).squeeze(1),
+        soft_usage = torch.softmax(
+            -distances / float(usage_temperature), dim=-1
+        ).mean(dim=0)
+        return quantized, codes, nearest[:, 0], margin, soft_usage
+
+    def forward(
+        self,
+        effects: Tensor,
+        *,
+        usage_temperature: float = 1.0,
+    ) -> VQForwardOutput:
+        encoder_latent = self.encoder(effects)
+        quantized, codes, distance, margin, soft_usage = self.quantize(
+            encoder_latent,
+            usage_temperature=usage_temperature,
         )
-    return torch.stack(centers)
+        straight_through = encoder_latent + (quantized - encoder_latent).detach()
+        reconstruction = self.decoder(straight_through)
+        return VQForwardOutput(
+            reconstruction=reconstruction,
+            encoder_latent=encoder_latent,
+            quantized_latent=quantized,
+            straight_through_latent=straight_through,
+            codes=codes,
+            nearest_squared_distance=distance,
+            relative_margin=margin,
+            soft_usage=soft_usage,
+        )
+
+    def decode_codes(self, codes: Tensor) -> Tensor:
+        return self.decoder(F.embedding(codes, self.codebook.weight))
 
 
-def _lloyd_once(
-    values: torch.Tensor,
+def vqvae_losses(
+    output: VQForwardOutput,
+    target: Tensor,
     *,
-    num_clusters: int,
-    max_iterations: int,
-    tolerance: float,
-    assignment_batch_size: int,
-    seed: int,
-    init_candidate_samples: int,
-    progress: Callable[[int, float, float, int], None] | None,
-) -> tuple[torch.Tensor, float, int]:
-    centers = _kmeans_plus_plus(
-        values,
-        num_clusters,
-        seed=seed,
-        candidate_samples=init_candidate_samples,
+    codebook_loss_weight: float,
+    commitment_loss_weight: float,
+    usage_loss_weight: float,
+) -> dict[str, Tensor]:
+    reconstruction = F.mse_loss(output.reconstruction.float(), target.float())
+    codebook = F.mse_loss(
+        output.quantized_latent.float(), output.encoder_latent.detach().float()
     )
-    generator = torch.Generator(device=values.device)
-    generator.manual_seed(seed + 1_000_003)
-    previous_inertia = math.inf
-    final_iteration = 0
-    for iteration in range(1, max_iterations + 1):
-        sums = torch.zeros_like(centers)
-        counts = torch.zeros(
-            num_clusters, dtype=torch.float32, device=values.device
-        )
-        inertia = 0.0
-        for start in range(0, len(values), assignment_batch_size):
-            batch = values[start : start + assignment_batch_size]
-            distances = _squared_distance(batch, centers)
-            nearest_distance, assignments = distances.min(dim=1)
-            sums.index_add_(0, assignments, batch)
-            counts += torch.bincount(
-                assignments, minlength=num_clusters
-            ).to(dtype=counts.dtype)
-            inertia += float(nearest_distance.sum().item())
-
-        updated = centers.clone()
-        nonempty = counts > 0
-        updated[nonempty] = sums[nonempty] / counts[nonempty, None]
-        empty_count = int((~nonempty).sum().item())
-        if empty_count:
-            replacements = torch.randint(
-                len(values),
-                (empty_count,),
-                generator=generator,
-                device=values.device,
-            )
-            updated[~nonempty] = values[replacements]
-
-        shift = float(torch.linalg.vector_norm(updated - centers, dim=1).max())
-        relative_improvement = (
-            math.inf
-            if not math.isfinite(previous_inertia)
-            else (previous_inertia - inertia) / max(previous_inertia, 1e-12)
-        )
-        centers = updated
-        final_iteration = iteration
-        if progress is not None:
-            progress(iteration, inertia / len(values), shift, empty_count)
-        if shift <= tolerance or (
-            math.isfinite(relative_improvement)
-            and 0.0 <= relative_improvement <= tolerance
-        ):
-            break
-        previous_inertia = inertia
-
-    final_inertia = 0.0
-    for start in range(0, len(values), assignment_batch_size):
-        distances = _squared_distance(
-            values[start : start + assignment_batch_size], centers
-        )
-        final_inertia += float(distances.min(dim=1).values.sum().item())
-    return centers, final_inertia / len(values), final_iteration
-
-
-def fit_full_kmeans(
-    standardized_descriptors: np.ndarray,
-    *,
-    num_clusters: int,
-    max_iterations: int = 50,
-    tolerance: float = 1e-4,
-    n_init: int = 1,
-    assignment_batch_size: int = 65_536,
-    init_candidate_samples: int = 0,
-    seed: int = 0,
-    device: str | torch.device = "cpu",
-    progress: Callable[[int, int, float, float, int], None] | None = None,
-) -> tuple[np.ndarray, dict[str, Any]]:
-    """Fit regular Lloyd K-means, using every sample on every iteration.
-
-    ``assignment_batch_size`` only bounds the temporary distance matrix.  It
-    does not change the objective or update centers from subsets, so this is not
-    MiniBatch K-means.
-    """
-    values_np = np.asarray(standardized_descriptors, dtype=np.float32)
-    if values_np.ndim != 2 or values_np.shape[1] != len(DESCRIPTOR_NAMES):
-        raise ValueError(
-            f"Expected standardized descriptors [N, {len(DESCRIPTOR_NAMES)}], got {values_np.shape}."
-        )
-    if not 1 < num_clusters <= len(values_np):
-        raise ValueError(
-            f"num_clusters must be in [2, {len(values_np)}], got {num_clusters}."
-        )
-    if min(max_iterations, n_init, assignment_batch_size) <= 0:
-        raise ValueError("K-means iteration, initialization, and batch values must be positive.")
-    if init_candidate_samples < 0:
-        raise ValueError("init_candidate_samples must be non-negative; zero means all samples.")
-    torch_device = torch.device(device)
-    values = torch.from_numpy(values_np).to(torch_device)
-    best_centers = None
-    best_inertia = math.inf
-    runs: list[dict[str, Any]] = []
-    for run in range(n_init):
-        callback = None
-        if progress is not None:
-            callback = lambda iteration, inertia, shift, empty, run=run: progress(
-                run + 1, iteration, inertia, shift, empty
-            )
-        centers, inertia, iterations = _lloyd_once(
-            values,
-            num_clusters=num_clusters,
-            max_iterations=max_iterations,
-            tolerance=tolerance,
-            assignment_batch_size=assignment_batch_size,
-            seed=seed + 104_729 * run,
-            init_candidate_samples=init_candidate_samples,
-            progress=callback,
-        )
-        runs.append(
-            {"run": run + 1, "iterations": iterations, "inertia": inertia}
-        )
-        if inertia < best_inertia:
-            best_inertia = inertia
-            best_centers = centers.detach().cpu().numpy().copy()
-    assert best_centers is not None
-    return best_centers.astype(np.float32), {
-        "inertia_per_sample": float(best_inertia),
-        "runs": runs,
+    commitment = F.mse_loss(
+        output.encoder_latent.float(), output.quantized_latent.detach().float()
+    )
+    probabilities = output.soft_usage.float().clamp_min(1e-12)
+    usage = torch.sum(
+        probabilities
+        * torch.log(probabilities * probabilities.new_tensor(len(probabilities)))
+    )
+    total = (
+        reconstruction
+        + float(codebook_loss_weight) * codebook
+        + float(commitment_loss_weight) * commitment
+        + float(usage_loss_weight) * usage
+    )
+    return {
+        "total": total,
+        "reconstruction": reconstruction,
+        "codebook": codebook,
+        "commitment": commitment,
+        "usage": usage,
     }
+
+
+def load_effect_checkpoint(
+    path: str | Path,
+    *,
+    map_location: str | torch.device = "cpu",
+) -> dict[str, Any]:
+    try:
+        payload = torch.load(path, map_location=map_location, weights_only=False)
+    except TypeError:
+        payload = torch.load(path, map_location=map_location)
+    if not isinstance(payload, dict):
+        raise ValueError(f"Invalid effect VQ-VAE checkpoint at {path}.")
+    version = int(payload.get("artifact_version", 0))
+    if version != ARTIFACT_VERSION:
+        raise ValueError(
+            f"Unsupported artifact version {version}; expected {ARTIFACT_VERSION}. "
+            "Direct K-means checkpoints cannot be resumed as VQ-VAE checkpoints."
+        )
+    return payload
 
 
 @dataclass
 class EffectTokenizer:
-    """Frozen global standardizer plus direct K-means centers."""
+    """Inference wrapper for effects already normalized by each OXE dataset."""
 
-    centers: np.ndarray
-    global_mean: np.ndarray
-    global_scale: np.ndarray
+    model: MLPEffectVQVAE
     gripper_weight: float
     config: dict[str, Any]
 
     def __post_init__(self) -> None:
-        self.centers = np.asarray(self.centers, dtype=np.float32)
-        self.global_mean = np.asarray(self.global_mean, dtype=np.float32)
-        self.global_scale = np.asarray(self.global_scale, dtype=np.float32)
-        if self.centers.ndim != 2 or self.centers.shape[1] != len(DESCRIPTOR_NAMES):
-            raise ValueError(
-                f"Expected centers [K, {len(DESCRIPTOR_NAMES)}], got {self.centers.shape}."
-            )
-        expected_shape = (self.centers.shape[1],)
-        if self.global_mean.shape != expected_shape:
-            raise ValueError(
-                f"Expected global_mean shape {expected_shape}, got {self.global_mean.shape}."
-            )
-        if self.global_scale.shape != expected_shape:
-            raise ValueError(
-                f"Expected global_scale shape {expected_shape}, got {self.global_scale.shape}."
-            )
-        if np.any(self.global_scale <= 0):
-            raise ValueError("global_scale must be strictly positive.")
         if self.gripper_weight <= 0:
             raise ValueError("gripper_weight must be strictly positive.")
 
     @property
     def codebook_size(self) -> int:
-        return int(self.centers.shape[0])
+        return self.model.codebook_size
 
     @property
     def descriptor_dim(self) -> int:
-        return int(self.centers.shape[1])
+        return self.model.config.input_dim
+
+    @property
+    def latent_dim(self) -> int:
+        return self.model.config.latent_dim
+
+    @property
+    def centers(self) -> np.ndarray:
+        return self.model.codebook.weight.detach().cpu().numpy().astype(np.float32)
 
     @property
     def raw_centers(self) -> np.ndarray:
-        return _inverse_standardize(
-            self.centers,
-            self.global_mean,
-            self.global_scale,
-            self.gripper_weight,
-        )
+        """Decode each latent code into an endpoint-effect prototype."""
+        was_training = self.model.training
+        self.model.eval()
+        device = next(self.model.parameters()).device
+        with torch.no_grad():
+            codes = torch.arange(self.codebook_size, device=device)
+            decoded = self.model.decode_codes(codes).float().cpu().numpy()
+        if was_training:
+            self.model.train()
+        return self.unweight(decoded)
 
-    def standardize(self, descriptors: np.ndarray) -> np.ndarray:
-        return _standardize(
-            descriptors,
-            self.global_mean,
-            self.global_scale,
-            self.gripper_weight,
+    def weight(self, descriptors: np.ndarray) -> np.ndarray:
+        return weight_effects(descriptors, self.gripper_weight)
+
+    def unweight(self, weighted: np.ndarray) -> np.ndarray:
+        return unweight_effects(weighted, self.gripper_weight)
+
+    def encode_reconstruct(
+        self,
+        descriptors: np.ndarray,
+        *,
+        batch_size: int = 65_536,
+        device: str | torch.device = "cpu",
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        weighted = self.weight(descriptors)
+        if weighted.ndim != 2 or weighted.shape[1] != self.descriptor_dim:
+            raise ValueError(
+                f"Expected descriptors [N, {self.descriptor_dim}], got {weighted.shape}."
+            )
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive.")
+        if len(weighted) == 0:
+            return (
+                np.empty(0, dtype=np.int64),
+                np.empty(0, dtype=np.float32),
+                np.empty(0, dtype=np.float32),
+                np.empty((0, self.descriptor_dim), dtype=np.float32),
+            )
+
+        torch_device = torch.device(device)
+        self.model.to(torch_device)
+        was_training = self.model.training
+        self.model.eval()
+        labels: list[np.ndarray] = []
+        distances: list[np.ndarray] = []
+        margins: list[np.ndarray] = []
+        reconstructions: list[np.ndarray] = []
+        with torch.no_grad():
+            for start in range(0, len(weighted), batch_size):
+                batch = torch.from_numpy(
+                    weighted[start : start + batch_size]
+                ).to(torch_device)
+                output = self.model(batch)
+                labels.append(output.codes.cpu().numpy())
+                distances.append(output.nearest_squared_distance.cpu().numpy())
+                margins.append(output.relative_margin.cpu().numpy())
+                reconstructions.append(output.reconstruction.float().cpu().numpy())
+        if was_training:
+            self.model.train()
+        reconstructed_raw = self.unweight(
+            np.concatenate(reconstructions).astype(np.float32)
+        )
+        return (
+            np.concatenate(labels).astype(np.int64),
+            np.concatenate(distances).astype(np.float32),
+            np.concatenate(margins).astype(np.float32),
+            reconstructed_raw,
         )
 
     def assign(
@@ -384,78 +392,61 @@ class EffectTokenizer:
         batch_size: int = 65_536,
         device: str | torch.device = "cpu",
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Return labels, nearest squared distance, and relative top-2 margin."""
-        standardized = self.standardize(descriptors)
-        if standardized.ndim != 2 or standardized.shape[1] != self.descriptor_dim:
-            raise ValueError(
-                f"Expected descriptors [N, {self.descriptor_dim}], got {standardized.shape}."
-            )
-        if len(standardized) == 0:
-            empty_labels = np.empty(0, dtype=np.int64)
-            empty_values = np.empty(0, dtype=np.float32)
-            return empty_labels, empty_values, empty_values.copy()
-        values = torch.from_numpy(standardized).to(device)
-        centers = torch.from_numpy(np.asarray(self.centers, dtype=np.float32)).to(
-            device
+        labels, distances, margins, _ = self.encode_reconstruct(
+            descriptors,
+            batch_size=batch_size,
+            device=device,
         )
-        labels: list[np.ndarray] = []
-        nearest_distances: list[np.ndarray] = []
-        margins: list[np.ndarray] = []
-        for start in range(0, len(values), batch_size):
-            distances = _squared_distance(values[start : start + batch_size], centers)
-            nearest, indices = torch.topk(
-                distances, k=min(2, self.codebook_size), largest=False, dim=1
-            )
-            labels.append(indices[:, 0].cpu().numpy())
-            nearest_distances.append(nearest[:, 0].cpu().numpy())
-            if nearest.shape[1] == 1:
-                margins.append(np.ones(len(nearest), dtype=np.float32))
-            else:
-                margins.append(
-                    (
-                        (nearest[:, 1] - nearest[:, 0])
-                        / nearest[:, 1].clamp_min(1e-8)
-                    )
-                    .cpu()
-                    .numpy()
-                )
-        return (
-            np.concatenate(labels).astype(np.int64),
-            np.concatenate(nearest_distances).astype(np.float32),
-            np.concatenate(margins).astype(np.float32),
-        )
+        return labels, distances, margins
 
-    def save(self, path: str | Path) -> None:
+    def save(
+        self,
+        path: str | Path,
+        *,
+        training_state: dict[str, Any] | None = None,
+    ) -> None:
         output = Path(path)
         output.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
+        payload: dict[str, Any] = {
             "artifact_version": ARTIFACT_VERSION,
-            "centers": torch.from_numpy(np.asarray(self.centers, dtype=np.float32)),
-            "global_mean": torch.from_numpy(
-                np.asarray(self.global_mean, dtype=np.float32)
-            ),
-            "global_scale": torch.from_numpy(
-                np.asarray(self.global_scale, dtype=np.float32)
-            ),
+            "model_type": "mlp_effect_vqvae",
+            "model_config": asdict(self.model.config),
+            "model_state_dict": self.model.state_dict(),
             "gripper_weight": float(self.gripper_weight),
             "config": dict(self.config),
             "descriptor_names": list(DESCRIPTOR_NAMES),
         }
-        torch.save(payload, output)
+        if training_state:
+            payload.update(training_state)
+        temporary = output.with_name(output.name + ".tmp")
+        torch.save(payload, temporary)
+        temporary.replace(output)
+
         metadata = {
             "artifact_version": ARTIFACT_VERSION,
+            "model_type": "mlp_effect_vqvae",
             "checkpoint": str(output),
-            "codebook_size": self.codebook_size,
+            "model_config": asdict(self.model.config),
             "descriptor_names": list(DESCRIPTOR_NAMES),
-            "global_normalization": "pooled_zscore_after_per_dataset_q01_q99_clip",
-            "global_mean": np.asarray(self.global_mean).tolist(),
-            "global_scale": np.asarray(self.global_scale).tolist(),
+            "input_normalization": "per_dataset_q01_q99_to_minus1_plus1_except_gripper",
             "gripper_weight": float(self.gripper_weight),
-            "raw_centers": self.raw_centers.tolist(),
+            "decoded_effect_prototypes": self.raw_centers.tolist(),
             "config": dict(self.config),
+            "global_step": int(payload.get("global_step", 0)),
         }
         output.with_suffix(".json").write_text(
             json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8"
+        )
+
+    @classmethod
+    def from_payload(cls, payload: dict[str, Any]) -> "EffectTokenizer":
+        model_config = MLPVQVAEConfig.from_dict(payload["model_config"])
+        model = MLPEffectVQVAE(model_config)
+        model.load_state_dict(payload["model_state_dict"])
+        return cls(
+            model=model,
+            gripper_weight=float(payload["gripper_weight"]),
+            config=dict(payload["config"]),
         )
 
     @classmethod
@@ -465,30 +456,6 @@ class EffectTokenizer:
         *,
         map_location: str | torch.device = "cpu",
     ) -> "EffectTokenizer":
-        try:
-            payload = torch.load(
-                path, map_location=map_location, weights_only=False
-            )
-        except TypeError:
-            payload = torch.load(path, map_location=map_location)
-        version = int(payload.get("artifact_version", 0))
-        if version != ARTIFACT_VERSION:
-            raise ValueError(
-                f"Unsupported effect tokenizer artifact version {version}; expected {ARTIFACT_VERSION}."
-            )
-        return cls(
-            centers=payload["centers"].detach().cpu().numpy().astype(np.float32),
-            global_mean=payload["global_mean"].detach().cpu().numpy().astype(np.float32),
-            global_scale=payload["global_scale"].detach().cpu().numpy().astype(np.float32),
-            gripper_weight=float(payload["gripper_weight"]),
-            config=dict(payload["config"]),
+        return cls.from_payload(
+            load_effect_checkpoint(path, map_location=map_location)
         )
-
-
-def standardize_for_fit(
-    descriptors: np.ndarray,
-    mean: np.ndarray,
-    scale: np.ndarray,
-    gripper_weight: float,
-) -> np.ndarray:
-    return _standardize(descriptors, mean, scale, gripper_weight)

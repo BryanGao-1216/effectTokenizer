@@ -1,4 +1,4 @@
-"""Evaluate direct endpoint-effect K-means tokens and render their trajectories."""
+"""Evaluate MLP effect VQ-VAE tokens and render assigned trajectories."""
 
 from __future__ import annotations
 
@@ -25,6 +25,7 @@ from scripts.effect_tokenizer.effect_tokenizer import (  # noqa: E402
     EffectTokenizer,
     choose_device,
     compute_effect_descriptors,
+    load_effect_checkpoint,
     set_seed,
 )
 
@@ -117,18 +118,23 @@ def _evaluation_metrics(
     tokenizer: EffectTokenizer,
     descriptors: np.ndarray,
     labels: np.ndarray,
-    squared_distances: np.ndarray,
+    latent_squared_distances: np.ndarray,
     margins: np.ndarray,
+    reconstruction: np.ndarray,
+    training_reconstruction_mse: float | None,
 ) -> dict[str, Any]:
-    raw_prediction = tokenizer.raw_centers[labels]
+    raw_prediction = reconstruction
     error = raw_prediction - descriptors
     per_dimension_mse = np.square(error).mean(axis=0)
-    baseline_error = descriptors - tokenizer.global_mean[None]
-    standardized = tokenizer.standardize(descriptors)
+    baseline_error = descriptors - descriptors.mean(axis=0, keepdims=True)
+    weighted_target = tokenizer.weight(descriptors)
+    weighted_prediction = tokenizer.weight(raw_prediction)
     mse = float(np.square(error).mean())
     baseline_mse = float(np.square(baseline_error).mean())
-    scaled_mse = float(squared_distances.mean() / tokenizer.descriptor_dim)
-    scaled_baseline_mse = float(np.square(standardized).mean())
+    weighted_mse = float(np.square(weighted_prediction - weighted_target).mean())
+    weighted_baseline_mse = float(
+        np.square(weighted_target - weighted_target.mean(axis=0, keepdims=True)).mean()
+    )
     gripper_threshold = 0.25
     target_gripper = np.where(
         descriptors[:, -1] > gripper_threshold,
@@ -141,29 +147,29 @@ def _evaluation_metrics(
         np.where(raw_prediction[:, -1] < -gripper_threshold, -1, 0),
     )
     changed_gripper = target_gripper != 0
-    training_inertia = tokenizer.config.get("kmeans", {}).get(
-        "inertia_per_sample"
-    )
-    training_scaled_mse = (
-        None
-        if training_inertia is None
-        else float(training_inertia) / tokenizer.descriptor_dim
-    )
     usage = _usage_metrics(labels, tokenizer.codebook_size)
+    prototype_codes, _, _ = tokenizer.assign(
+        tokenizer.raw_centers,
+        batch_size=tokenizer.codebook_size,
+        device=next(tokenizer.model.parameters()).device,
+    )
+    cycle_consistency = float(
+        np.mean(prototype_codes == np.arange(tokenizer.codebook_size))
+    )
     return {
-        "scaled_mse": scaled_mse,
-        "scaled_r2_vs_training_global_mean": float(
-            1.0 - scaled_mse / max(scaled_baseline_mse, 1e-12)
+        "weighted_reconstruction_mse": weighted_mse,
+        "weighted_reconstruction_r2": float(
+            1.0 - weighted_mse / max(weighted_baseline_mse, 1e-12)
         ),
-        "training_scaled_mse": training_scaled_mse,
-        "validation_to_training_mse_ratio": (
+        "training_weighted_reconstruction_mse": training_reconstruction_mse,
+        "validation_to_training_reconstruction_ratio": (
             None
-            if training_scaled_mse is None
-            else scaled_mse / max(training_scaled_mse, 1e-12)
+            if training_reconstruction_mse is None
+            else weighted_mse / max(training_reconstruction_mse, 1e-12)
         ),
-        "raw_mse": mse,
-        "raw_rmse": float(np.sqrt(mse)),
-        "raw_r2_vs_training_global_mean": float(
+        "effect_mse": mse,
+        "effect_rmse": float(np.sqrt(mse)),
+        "effect_r2": float(
             1.0 - mse / max(baseline_mse, 1e-12)
         ),
         "position_mse": float(per_dimension_mse[:3].mean()),
@@ -182,6 +188,10 @@ def _evaluation_metrics(
         "per_dimension_mse": per_dimension_mse,
         "relative_margin_mean": float(margins.mean()),
         "relative_margin_p10": float(np.quantile(margins, 0.1)),
+        "latent_commitment_mse": float(
+            latent_squared_distances.mean() / tokenizer.latent_dim
+        ),
+        "code_cycle_consistency": cycle_consistency,
         "usage": usage,
     }
 
@@ -198,11 +208,14 @@ def _sanity_checks(
             and usage["perplexity"] >= 0.25 * codebook_size
             and usage["top_probability"] <= 0.2
         ),
-        "clusters_explain_effect_variance": bool(
-            metrics["scaled_r2_vs_training_global_mean"] > 0.0
+        "vqvae_explains_effect_variance": bool(
+            metrics["weighted_reconstruction_r2"] > 0.0
         ),
         "assignments_have_separation": bool(
             metrics["relative_margin_mean"] >= 0.05
+        ),
+        "code_decode_encode_cycle": bool(
+            metrics["code_cycle_consistency"] >= 0.9
         ),
     }
 
@@ -263,8 +276,8 @@ def _token_figure(
         cols=3,
         specs=[[{"type": "scene"}, {"type": "scene"}, {"type": "xy"}]],
         subplot_titles=(
-            "Position trajectory",
-            "Rotation trajectory",
+            "Position trajectory (dataset-normalized)",
+            "Rotation trajectory (dataset-normalized)",
             "Gripper open/close",
         ),
         horizontal_spacing=0.045,
@@ -374,8 +387,8 @@ def _token_figure(
             col=3,
         )
 
-    # The center is an endpoint effect, not a decoded path.  Display it as a
-    # dashed straight reference so it cannot be mistaken for a generated action.
+    # The VQ-VAE decoder predicts an endpoint effect, not a full path. Display
+    # it as a dashed reference so it cannot be mistaken for a generated action.
     for column, endpoint in ((1, raw_center[:3]), (2, raw_center[3:6])):
         figure.add_trace(
             go.Scatter3d(
@@ -383,7 +396,7 @@ def _token_figure(
                 y=[0.0, float(endpoint[1])],
                 z=[0.0, float(endpoint[2])],
                 mode="lines+markers",
-                name="K-means endpoint center",
+                name="VQ-VAE decoded effect",
                 legendgroup="center",
                 showlegend=column == 1,
                 line={"color": "#111827", "width": 4, "dash": "dash"},
@@ -403,7 +416,7 @@ def _token_figure(
         title={
             "text": (
                 f"Effect token {code_id:03d}<br><sup>assigned={assigned_count} · "
-                f"shown={len(examples)} · center Δgripper={raw_center[6]:.4f}</sup>"
+                        f"shown={len(examples)} · decoded Δgripper={raw_center[6]:.4f}</sup>"
             ),
             "x": 0.5,
             "xanchor": "center",
@@ -414,14 +427,14 @@ def _token_figure(
         margin={"l": 25, "r": 25, "b": 55, "t": 110},
         legend={"orientation": "h", "x": 0.5, "xanchor": "center", "y": -0.07},
         scene={
-            "xaxis": {"title": "X"},
-            "yaxis": {"title": "Y"},
-            "zaxis": {"title": "Z"},
+            "xaxis": {"title": "normalized ΔX"},
+            "yaxis": {"title": "normalized ΔY"},
+            "zaxis": {"title": "normalized ΔZ"},
         },
         scene2={
-            "xaxis": {"title": "Roll"},
-            "yaxis": {"title": "Pitch"},
-            "zaxis": {"title": "Yaw"},
+            "xaxis": {"title": "normalized ΔRoll"},
+            "yaxis": {"title": "normalized ΔPitch"},
+            "zaxis": {"title": "normalized ΔYaw"},
         },
     )
     figure.update_xaxes(title_text="time (s)", row=1, col=3)
@@ -546,8 +559,8 @@ def _write_token_csv(
             "token_id",
             "count",
             "frequency",
-            "within_raw_mse",
-            *[f"center_{name}" for name in DESCRIPTOR_NAMES],
+            "within_effect_mse",
+            *[f"decoded_{name}" for name in DESCRIPTOR_NAMES],
         ]
         writer = csv.DictWriter(file, fieldnames=fields)
         writer.writeheader()
@@ -562,11 +575,11 @@ def _write_token_csv(
                 "token_id": code_id,
                 "count": int(counts[code_id]),
                 "frequency": float(counts[code_id] / max(len(labels), 1)),
-                "within_raw_mse": within,
+                "within_effect_mse": within,
             }
             row.update(
                 {
-                    f"center_{name}": float(centers[code_id, dimension])
+                    f"decoded_{name}": float(centers[code_id, dimension])
                     for dimension, name in enumerate(DESCRIPTOR_NAMES)
                 }
             )
@@ -574,14 +587,16 @@ def _write_token_csv(
 
 
 def _write_summary(path: Path, metrics: dict[str, Any]) -> None:
-    usage = metrics["clustering"]["usage"]
-    clustering = metrics["clustering"]
+    result = metrics["vqvae"]
+    usage = result["usage"]
     checks = metrics["sanity_checks"]
     passed = sum(checks.values())
-    training_scaled_mse = clustering["training_scaled_mse"]
-    validation_to_training = clustering["validation_to_training_mse_ratio"]
-    training_scaled_mse_text = (
-        "n/a" if training_scaled_mse is None else f"{training_scaled_mse:.8f}"
+    training_mse = result["training_weighted_reconstruction_mse"]
+    validation_to_training = result[
+        "validation_to_training_reconstruction_ratio"
+    ]
+    training_mse_text = (
+        "n/a" if training_mse is None else f"{training_mse:.8f}"
     )
     validation_to_training_text = (
         "n/a"
@@ -589,16 +604,16 @@ def _write_summary(path: Path, metrics: dict[str, Any]) -> None:
         else f"{validation_to_training:.6f}"
     )
     lines = [
-        "# Direct Effect-Token K-means Evaluation",
+        "# MLP Effect VQ-VAE Evaluation",
         "",
         f"Checkpoint: `{metrics['checkpoint']}`",
         "",
         "## Data contract",
         "",
-        "- Actions are resampled before statistics and clipping.",
-        "- Each dataset is clipped to its own action q01/q99 without per-dataset scaling.",
-        "- Seven-dimensional effects are pooled and transformed by one training-set z-score.",
-        "- Clustering uses regular Lloyd K-means, not MiniBatch K-means.",
+        "- Actions are resampled before normalization and chunking.",
+        "- Each dataset independently maps its action q01/q99 to [-1, 1], exactly as myStudy.",
+        "- The gripper remains an absolute value; no pooled global z-score is fitted.",
+        "- A simple MLP encoder, one learned codebook, and an MLP decoder are trained jointly.",
         "",
         "## Sanity checks",
         "",
@@ -611,7 +626,7 @@ def _write_summary(path: Path, metrics: dict[str, Any]) -> None:
             for name, result in checks.items()
         ],
         "",
-        "## Validation clustering",
+        "## Validation VQ-VAE",
         "",
         "| Metric | Value |",
         "|---|---:|",
@@ -620,22 +635,24 @@ def _write_summary(path: Path, metrics: dict[str, Any]) -> None:
         f"| Perplexity | {usage['perplexity']:.4f} |",
         f"| Normalized entropy | {usage['normalized_entropy']:.6f} |",
         f"| Top probability | {usage['top_probability']:.6f} |",
-        f"| Scaled descriptor MSE | {clustering['scaled_mse']:.8f} |",
-        f"| Scaled descriptor R² | {clustering['scaled_r2_vs_training_global_mean']:.6f} |",
-        f"| Training scaled MSE | {training_scaled_mse_text} |",
-        f"| Validation/training MSE ratio | {validation_to_training_text} |",
-        f"| Raw descriptor MSE | {clustering['raw_mse']:.8f} |",
-        f"| Raw descriptor R² | {clustering['raw_r2_vs_training_global_mean']:.6f} |",
-        f"| Position MSE | {clustering['position_mse']:.8f} |",
-        f"| Rotation MSE | {clustering['rotation_mse']:.8f} |",
-        f"| Gripper MSE | {clustering['gripper_mse']:.8f} |",
-        f"| Gripper direction accuracy | {clustering['gripper_direction_accuracy']:.6f} |",
-        f"| Gripper change rate | {clustering['gripper_change_rate']:.6f} |",
-        f"| Changed-gripper direction accuracy | {clustering['gripper_changed_direction_accuracy']:.6f} |",
-        f"| Assignment margin mean | {clustering['relative_margin_mean']:.6f} |",
-        f"| Assignment margin p10 | {clustering['relative_margin_p10']:.6f} |",
+        f"| Weighted reconstruction MSE | {result['weighted_reconstruction_mse']:.8f} |",
+        f"| Weighted reconstruction R² | {result['weighted_reconstruction_r2']:.6f} |",
+        f"| Training weighted reconstruction MSE | {training_mse_text} |",
+        f"| Validation/training reconstruction ratio | {validation_to_training_text} |",
+        f"| Unweighted effect MSE | {result['effect_mse']:.8f} |",
+        f"| Unweighted effect R² | {result['effect_r2']:.6f} |",
+        f"| Position MSE | {result['position_mse']:.8f} |",
+        f"| Rotation MSE | {result['rotation_mse']:.8f} |",
+        f"| Gripper MSE | {result['gripper_mse']:.8f} |",
+        f"| Gripper direction accuracy | {result['gripper_direction_accuracy']:.6f} |",
+        f"| Gripper change rate | {result['gripper_change_rate']:.6f} |",
+        f"| Changed-gripper direction accuracy | {result['gripper_changed_direction_accuracy']:.6f} |",
+        f"| Latent commitment MSE | {result['latent_commitment_mse']:.8f} |",
+        f"| Assignment margin mean | {result['relative_margin_mean']:.6f} |",
+        f"| Assignment margin p10 | {result['relative_margin_p10']:.6f} |",
+        f"| Code decode/encode cycle | {result['code_cycle_consistency']:.6f} |",
         "",
-        "The per-token HTML pages show assigned validation trajectories, their mean trajectory, and the K-means endpoint center.",
+        "The per-token HTML pages show assigned validation trajectories, their mean trajectory, and the endpoint effect decoded from that VQ code.",
         "",
     ]
     path.write_text("\n".join(lines), encoding="utf-8")
@@ -643,7 +660,7 @@ def _write_summary(path: Path, metrics: dict[str, Any]) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Evaluate a direct endpoint-effect K-means tokenizer.",
+        description="Evaluate a single-codebook MLP effect VQ-VAE.",
         allow_abbrev=False,
     )
     parser.add_argument("--checkpoint", required=True)
@@ -683,13 +700,15 @@ def main() -> None:
 
     started = time.perf_counter()
     set_seed(args.seed)
-    _log(f"[1/7] loading effect tokenizer: {Path(args.checkpoint).resolve()}")
-    tokenizer = EffectTokenizer.load(args.checkpoint)
+    _log(f"[1/7] loading effect VQ-VAE: {Path(args.checkpoint).resolve()}")
+    payload = load_effect_checkpoint(args.checkpoint, map_location="cpu")
+    tokenizer = EffectTokenizer.from_payload(payload)
     config = tokenizer.config
+    data_config = config["data"]
     device = choose_device(args.device)
     _log(
-        f"tokenizer loaded: K={tokenizer.codebook_size} dim={tokenizer.descriptor_dim} "
-        f"device={device}"
+        f"VQ-VAE loaded: K={tokenizer.codebook_size} latent={tokenizer.latent_dim} "
+        f"effect_dim={tokenizer.descriptor_dim} step={payload.get('global_step', 0)} device={device}"
     )
 
     try:
@@ -699,21 +718,21 @@ def main() -> None:
     except ModuleNotFoundError:
         pass
     _log(
-        f"[2/7] building clipped validation stream: dataset={args.test_dataset_name} "
-        f"target_hz={config['target_control_hz']} horizon={config['horizon']} "
-        f"stride={config['sampling_stride']}"
+        f"[2/7] building per-dataset q01/q99-normalized validation stream: "
+        f"dataset={args.test_dataset_name} target_hz={data_config['target_control_hz']} "
+        f"horizon={data_config['horizon']} stride={data_config['sampling_stride']}"
     )
     dataset = OXEActionDataset(
         args.data_root_dir,
         args.test_dataset_name,
-        horizon=int(config["horizon"]),
-        sampling_stride=int(config["sampling_stride"]),
-        target_control_hz=float(config["target_control_hz"]),
-        action_dim=int(config["action_dim"]),
+        horizon=int(data_config["horizon"]),
+        sampling_stride=int(data_config["sampling_stride"]),
+        target_control_hz=float(data_config["target_control_hz"]),
+        action_dim=int(data_config["action_dim"]),
         train=False,
         shuffle_buffer_size=args.num_samples,
         sample_ratio=1.0,
-        balance_weights=bool(config.get("balance_weights", True)),
+        balance_weights=bool(data_config.get("balance_weights", True)),
         traj_transform_threads=(
             args.rlds_traj_transform_threads
             if args.rlds_traj_transform_threads > 0
@@ -724,8 +743,7 @@ def main() -> None:
             if args.rlds_traj_read_threads > 0
             else None
         ),
-        storage_format=str(config["rlds_storage_format"]),
-        action_normalization="clip_q99",
+        storage_format=str(data_config["rlds_storage_format"]),
         seed=args.seed,
     )
     _log(dataset.summary())
@@ -742,17 +760,28 @@ def main() -> None:
         log_every_batches=args.log_every_batches,
     )
 
-    _log("[3/7] computing endpoint effects and assigning nearest tokens")
+    _log("[3/7] encoding effects, quantizing tokens, and decoding reconstructions")
     descriptors = compute_effect_descriptors(actions)
-    labels, squared_distances, margins = tokenizer.assign(
+    labels, squared_distances, margins, reconstruction = tokenizer.encode_reconstruct(
         descriptors,
         batch_size=args.assignment_batch_size,
         device=device,
     )
-    clustering = _evaluation_metrics(
-        tokenizer, descriptors, labels, squared_distances, margins
+    last_validation = payload.get("last_validation") or {}
+    result = _evaluation_metrics(
+        tokenizer,
+        descriptors,
+        labels,
+        squared_distances,
+        margins,
+        reconstruction,
+        (
+            float(last_validation["reconstruction"])
+            if "reconstruction" in last_validation
+            else None
+        ),
     )
-    usage = clustering["usage"]
+    usage = result["usage"]
     _log(
         f"usage: used={usage['used_codes']}/{tokenizer.codebook_size} "
         f"ppl={usage['perplexity']:.2f} H={usage['normalized_entropy']:.4f} "
@@ -784,7 +813,7 @@ def main() -> None:
             assigned_count=int(usage["counts"][code_id]),
             examples=examples[code_id, :shown],
             mean_action=mean_actions[code_id],
-            target_control_hz=float(config["target_control_hz"]),
+            target_control_hz=float(data_config["target_control_hz"]),
         )
         figure.write_html(
             trajectory_dir / f"token_{code_id:03d}.html",
@@ -832,7 +861,8 @@ def main() -> None:
         actions=examples,
         example_counts=example_counts,
         mean_actions=mean_actions,
-        raw_centers=tokenizer.raw_centers,
+        decoded_effect_prototypes=tokenizer.raw_centers,
+        reconstructed_effects=reconstruction,
         assignment_counts=np.asarray(usage["counts"]),
     )
 
@@ -840,27 +870,26 @@ def main() -> None:
         "checkpoint": str(Path(args.checkpoint).resolve()),
         "elapsed_seconds": float(time.perf_counter() - started),
         "model": {
-            "type": "direct_effect_kmeans",
-            "algorithm": "full_lloyd",
+            "type": "mlp_effect_vqvae",
             "codebook_size": tokenizer.codebook_size,
             "descriptor_dim": tokenizer.descriptor_dim,
+            "latent_dim": tokenizer.latent_dim,
             "descriptor_names": list(DESCRIPTOR_NAMES),
-            "global_mean": tokenizer.global_mean,
-            "global_scale": tokenizer.global_scale,
             "gripper_weight": tokenizer.gripper_weight,
+            "global_step": int(payload.get("global_step", 0)),
         },
         "data": {
             "dataset_name": args.test_dataset_name,
             "samples": len(actions),
             "dataset_summary": dataset.summary(),
-            "preprocessing": "per_dataset_q01_q99_clip_then_pooled_effect_zscore",
-            "target_control_hz": config["target_control_hz"],
-            "horizon": config["horizon"],
-            "sampling_stride": config["sampling_stride"],
+            "preprocessing": "per_dataset_q01_q99_to_minus1_plus1_except_gripper",
+            "target_control_hz": data_config["target_control_hz"],
+            "horizon": data_config["horizon"],
+            "sampling_stride": data_config["sampling_stride"],
         },
-        "clustering": clustering,
+        "vqvae": result,
         "sanity_checks": _sanity_checks(
-            clustering,
+            result,
             codebook_size=tokenizer.codebook_size,
         ),
     }

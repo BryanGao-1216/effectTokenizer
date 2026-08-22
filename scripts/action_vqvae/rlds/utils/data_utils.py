@@ -51,7 +51,6 @@ class NormalizationType(str, Enum):
     NORMAL = "normal"               # Normalize to Mean = 0, Stdev = 1
     BOUNDS = "bounds"               # Normalize to Interval = [-1, 1]
     BOUNDS_Q99 = "bounds_q99"       # Normalize [quantile_01, ..., quantile_99] --> [-1, ..., 1]
-    BOUNDS_Q99_CLIP = "bounds_q99_clip"  # Clip to [quantile_01, quantile_99] without scaling
     # fmt: on
 
 
@@ -74,42 +73,30 @@ def normalize_action_and_proprio(traj: Dict, metadata: Dict, normalization_type:
 
         return traj
 
-    elif normalization_type in [
-        NormalizationType.BOUNDS,
-        NormalizationType.BOUNDS_Q99,
-        NormalizationType.BOUNDS_Q99_CLIP,
-    ]:
+    elif normalization_type in [NormalizationType.BOUNDS, NormalizationType.BOUNDS_Q99]:
         for key, traj_key in keys_to_normalize.items():
             if normalization_type == NormalizationType.BOUNDS:
                 low = metadata[key]["min"]
                 high = metadata[key]["max"]
-            else:
+            elif normalization_type == NormalizationType.BOUNDS_Q99:
                 low = metadata[key]["q01"]
                 high = metadata[key]["q99"]
             mask = metadata[key].get("mask", tf.ones_like(metadata[key]["min"], dtype=tf.bool))
-            if normalization_type == NormalizationType.BOUNDS_Q99_CLIP:
-                traj = dl.transforms.selective_tree_map(
-                    traj,
-                    match=lambda k, _: k == traj_key,
-                    map_fn=lambda x: tf.where(mask, tf.clip_by_value(x, low, high), x),
-                )
-            else:
-                traj = dl.transforms.selective_tree_map(
-                    traj,
-                    match=lambda k, _: k == traj_key,
-                    map_fn=lambda x: tf.where(
-                        mask,
-                        tf.clip_by_value(2 * (x - low) / (high - low + 1e-8) - 1, -1, 1),
-                        x,
-                    ),
-                )
+            traj = dl.transforms.selective_tree_map(
+                traj,
+                match=lambda k, _: k == traj_key,
+                map_fn=lambda x: tf.where(
+                    mask,
+                    tf.clip_by_value(2 * (x - low) / (high - low + 1e-8) - 1, -1, 1),
+                    x,
+                ),
+            )
 
             # Note (Moo Jin): Map unused action dimensions (i.e., dimensions where min == max) to all 0s.
-            if normalization_type != NormalizationType.BOUNDS_Q99_CLIP:
-                zeros_mask = metadata[key]["min"] == metadata[key]["max"]
-                traj = dl.transforms.selective_tree_map(
-                    traj, match=lambda k, _: k == traj_key, map_fn=lambda x: tf.where(zeros_mask, 0.0, x)
-                )
+            zeros_mask = metadata[key]["min"] == metadata[key]["max"]
+            traj = dl.transforms.selective_tree_map(
+                traj, match=lambda k, _: k == traj_key, map_fn=lambda x: tf.where(zeros_mask, 0.0, x)
+            )
 
         return traj
 

@@ -2,9 +2,8 @@
 
 The underlying RLDS implementation in :mod:`rlds` is vendored from VQ-VLA and
 keeps its important data contract: every dataset is standardized to relative
-EEF actions and future actions are chunked online.  Callers may either use the
-original per-dataset q01/q99 scaling or only clip to those bounds before a
-later pooled normalization stage.
+EEF actions, dimensions other than the gripper are normalized with per-dataset
+1st/99th percentiles, and future actions are chunked online.
 """
 
 from __future__ import annotations
@@ -80,7 +79,6 @@ class OXEActionDataset(IterableDataset[tuple[Tensor]]):
         traj_transform_threads: int | None = None,
         traj_read_threads: int | None = None,
         storage_format: str = "auto",
-        action_normalization: str = "bounds_q99",
         seed: int = 0,
     ) -> None:
         super().__init__()
@@ -107,11 +105,6 @@ class OXEActionDataset(IterableDataset[tuple[Tensor]]):
                 "storage_format must be 'auto', 'tfds', 'webdataset', or 'hybrid', "
                 f"got {storage_format!r}"
             )
-        if action_normalization not in {"bounds_q99", "clip_q99"}:
-            raise ValueError(
-                "action_normalization must be 'bounds_q99' or 'clip_q99', "
-                f"got {action_normalization!r}"
-            )
 
         self.data_root_dir = Path(data_root_dir)
         self.data_mix = data_mix
@@ -124,7 +117,6 @@ class OXEActionDataset(IterableDataset[tuple[Tensor]]):
         self.train = bool(train)
         self.sample_ratio = float(sample_ratio)
         self.shuffle_buffer_size = int(shuffle_buffer_size)
-        self.action_normalization = action_normalization
         self.seed = int(seed)
 
         if data_mix in OXE_NAMED_MIXTURES:
@@ -140,11 +132,6 @@ class OXEActionDataset(IterableDataset[tuple[Tensor]]):
 
         # Action-only VQ-VAE training does not decode images, proprioception, or
         # language. Empty camera views avoids unnecessary observation plumbing.
-        normalization_type = (
-            NormalizationType.BOUNDS_Q99
-            if self.action_normalization == "bounds_q99"
-            else NormalizationType.BOUNDS_Q99_CLIP
-        )
         per_dataset_kwargs, weights = get_oxe_dataset_kwargs_and_weights(
             self.data_root_dir,
             mixture_spec,
@@ -152,17 +139,9 @@ class OXEActionDataset(IterableDataset[tuple[Tensor]]):
             load_depth=False,
             load_proprio=False,
             load_language=False,
-            action_proprio_normalization_type=normalization_type,
+            action_proprio_normalization_type=NormalizationType.BOUNDS_Q99,
             target_control_hz=self.target_control_hz,
         )
-        if self.action_normalization == "clip_q99":
-            # The direct effect tokenizer clusters gripper changes as well as
-            # translation and rotation, so clip every action dimension.  The
-            # absolute mask still controls frequency resampling and tail fill.
-            for dataset_kwargs in per_dataset_kwargs:
-                dataset_kwargs["action_normalization_mask"] = [
-                    True
-                ] * len(dataset_kwargs["absolute_action_mask"])
         if not per_dataset_kwargs:
             raise ValueError(
                 f"No supported EEF action datasets remain in mixture {data_mix!r}"
@@ -487,22 +466,13 @@ class OXEActionDataset(IterableDataset[tuple[Tensor]]):
                         source_hz=source["source_control_hz"],
                         target_hz=source["target_control_hz"],
                     )
-                if self.action_normalization == "clip_q99":
-                    normalized = np.where(
-                        normalization_mask,
-                        np.clip(action, low, high),
-                        action,
-                    ).astype(np.float32)
-                else:
-                    normalized = np.clip(
-                        2.0 * (action - low) / (high - low + 1e-8) - 1.0,
-                        -1.0,
-                        1.0,
-                    )
-                    normalized = np.where(normalization_mask, normalized, action)
-                    normalized = np.where(
-                        minimum == maximum, 0.0, normalized
-                    ).astype(np.float32)
+                normalized = np.clip(
+                    2.0 * (action - low) / (high - low + 1e-8) - 1.0, -1.0, 1.0
+                )
+                normalized = np.where(normalization_mask, normalized, action)
+                normalized = np.where(minimum == maximum, 0.0, normalized).astype(
+                    np.float32
+                )
                 frame_indices = np.arange(
                     0, normalized.shape[0], self.sampling_stride
                 )
@@ -654,7 +624,6 @@ class OXEActionDataset(IterableDataset[tuple[Tensor]]):
             f"estimated_samples={self.dataset_length} horizon={self.horizon} "
             f"target_control_hz={self.target_control_hz or 'native'} "
             f"sampling_stride={self.sampling_stride} action_dim={self.action_dim}"
-            f" action_normalization={self.action_normalization}"
         )
 
     @property
