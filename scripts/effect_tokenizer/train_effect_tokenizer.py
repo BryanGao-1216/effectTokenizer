@@ -24,6 +24,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from scripts.effect_tokenizer.effect_tokenizer import (  # noqa: E402
     DESCRIPTOR_NAMES,
+    DeadCodeTracker,
     EffectTokenizer,
     MLPEffectVQVAE,
     MLPVQVAEConfig,
@@ -78,12 +79,13 @@ def _actions_to_effect_tensor(
     actions: Tensor,
     *,
     gripper_weight: float,
+    effect_scale: tuple[float, ...],
     device: torch.device,
 ) -> Tensor:
     descriptors = compute_effect_descriptors(
         actions.numpy().astype(np.float32, copy=False)
     )
-    weighted = weight_effects(descriptors, gripper_weight)
+    weighted = weight_effects(descriptors, gripper_weight, effect_scale)
     return torch.from_numpy(weighted).to(device, non_blocking=True)
 
 
@@ -116,6 +118,7 @@ def _collect_validation_effects(
     *,
     num_samples: int,
     gripper_weight: float,
+    effect_scale: tuple[float, ...],
 ) -> np.ndarray:
     chunks: list[np.ndarray] = []
     collected = 0
@@ -123,7 +126,7 @@ def _collect_validation_effects(
         remaining = num_samples - collected
         values = actions.numpy().astype(np.float32, copy=False)[:remaining]
         descriptors = compute_effect_descriptors(values)
-        chunks.append(weight_effects(descriptors, gripper_weight))
+        chunks.append(weight_effects(descriptors, gripper_weight, effect_scale))
         collected += len(descriptors)
         if collected >= num_samples:
             break
@@ -132,6 +135,116 @@ def _collect_validation_effects(
             f"Validation stream returned {collected} effects, expected {num_samples}."
         )
     return np.concatenate(chunks).astype(np.float32)
+
+
+def _collect_training_effects(
+    loader: DataLoader,
+    iterator: Iterator[tuple[Tensor]],
+    *,
+    num_samples: int,
+    gripper_weight: float,
+    effect_scale: tuple[float, ...],
+) -> tuple[np.ndarray, Iterator[tuple[Tensor]]]:
+    chunks: list[np.ndarray] = []
+    collected = 0
+    while collected < num_samples:
+        (actions,), iterator = _next_batch(loader, iterator)
+        remaining = num_samples - collected
+        descriptors = compute_effect_descriptors(
+            actions.numpy().astype(np.float32, copy=False)[:remaining]
+        )
+        chunks.append(
+            weight_effects(descriptors, gripper_weight, effect_scale)
+        )
+        collected += len(descriptors)
+    return np.concatenate(chunks).astype(np.float32), iterator
+
+
+def _squared_distances_numpy(values: np.ndarray, centers: np.ndarray) -> np.ndarray:
+    return np.maximum(
+        np.square(values).sum(axis=1, keepdims=True)
+        + np.square(centers).sum(axis=1)[None, :]
+        - 2.0 * values @ centers.T,
+        0.0,
+    )
+
+
+@torch.no_grad()
+def _initialize_codebook_from_effects(
+    model: MLPEffectVQVAE,
+    effects: np.ndarray,
+    *,
+    batch_size: int,
+    device: torch.device,
+    iterations: int,
+    seed: int,
+) -> np.ndarray:
+    """Run full Lloyd K-means on encoder outputs only to initialize VQ entries."""
+    model.eval()
+    latent_chunks: list[np.ndarray] = []
+    for start in range(0, len(effects), batch_size):
+        batch = torch.from_numpy(effects[start : start + batch_size]).to(device)
+        latent_chunks.append(model.encode(batch).float().cpu().numpy())
+    latents = np.concatenate(latent_chunks).astype(np.float32, copy=False)
+    if len(latents) < model.codebook_size:
+        raise ValueError(
+            f"Need at least {model.codebook_size} initialization samples, got {len(latents)}."
+        )
+
+    rng = np.random.default_rng(seed)
+    centers = np.empty(
+        (model.codebook_size, model.config.latent_dim), dtype=np.float32
+    )
+    first = int(rng.integers(len(latents)))
+    centers[0] = latents[first]
+    minimum_distance = np.square(latents - centers[0]).sum(axis=1)
+    for index in range(1, model.codebook_size):
+        total = float(minimum_distance.sum())
+        if total <= 1e-12:
+            selected = int(rng.integers(len(latents)))
+        else:
+            probabilities = minimum_distance.astype(np.float64)
+            probabilities /= probabilities.sum()
+            selected = int(rng.choice(len(latents), p=probabilities))
+        centers[index] = latents[selected]
+        new_distance = np.square(latents - centers[index]).sum(axis=1)
+        minimum_distance = np.minimum(minimum_distance, new_distance)
+
+    counts = np.zeros(model.codebook_size, dtype=np.int64)
+    for _ in range(iterations):
+        distances = _squared_distances_numpy(latents, centers)
+        labels = distances.argmin(axis=1)
+        minimum_distance = distances[np.arange(len(latents)), labels]
+        counts = np.bincount(labels, minlength=model.codebook_size)
+        next_centers = centers.copy()
+        for index in range(model.codebook_size):
+            assigned = labels == index
+            if np.any(assigned):
+                next_centers[index] = latents[assigned].mean(axis=0)
+            else:
+                replacement = int(np.argmax(minimum_distance))
+                next_centers[index] = latents[replacement]
+                minimum_distance[replacement] = -1.0
+        if model.config.normalize_latents:
+            norms = np.linalg.norm(next_centers, axis=1, keepdims=True)
+            next_centers /= np.maximum(norms, 1e-6)
+        if np.allclose(next_centers, centers, rtol=1e-5, atol=1e-6):
+            centers = next_centers
+            break
+        centers = next_centers
+
+    final_distances = _squared_distances_numpy(latents, centers)
+    final_labels = final_distances.argmin(axis=1)
+    counts = np.bincount(final_labels, minlength=model.codebook_size)
+    model.codebook.weight.copy_(
+        torch.from_numpy(centers).to(
+            device=model.codebook.weight.device,
+            dtype=model.codebook.weight.dtype,
+        )
+    )
+    model.normalize_codebook_()
+    model.train()
+    return counts
 
 
 @torch.no_grad()
@@ -153,7 +266,11 @@ def _validate(
         "codebook": 0.0,
         "commitment": 0.0,
         "usage": 0.0,
+        "usage_balance": 0.0,
+        "assignment_entropy": 0.0,
         "margin": 0.0,
+        "encoder_norm": 0.0,
+        "quantization_rmse": 0.0,
     }
     counts = np.zeros(model.codebook_size, dtype=np.int64)
     seen = 0
@@ -169,9 +286,26 @@ def _validate(
         )
         size = len(batch)
         seen += size
-        for key in ("total", "reconstruction", "codebook", "commitment", "usage"):
+        for key in (
+            "total",
+            "reconstruction",
+            "codebook",
+            "commitment",
+            "usage",
+            "usage_balance",
+            "assignment_entropy",
+        ):
             totals[key] += float(losses[key]) * size
         totals["margin"] += float(output.relative_margin.mean()) * size
+        totals["encoder_norm"] += float(
+            output.encoder_latent.float().norm(dim=-1).mean()
+        ) * size
+        totals["quantization_rmse"] += float(
+            torch.sqrt(
+                output.nearest_squared_distance.float().mean()
+                / model.config.latent_dim
+            )
+        ) * size
         counts += np.bincount(
             output.codes.cpu().numpy(), minlength=model.codebook_size
         )
@@ -180,6 +314,10 @@ def _validate(
         key: value / max(seen, 1) for key, value in totals.items()
     }
     result.update(_usage_metrics(counts))
+    result["unused_codes"] = model.codebook_size - int(result["used_codes"])
+    result["codebook_norm"] = float(
+        model.normalized_codebook().float().norm(dim=-1).mean()
+    )
     return result
 
 
@@ -190,7 +328,11 @@ def _optimizer_to(optimizer: torch.optim.Optimizer, device: torch.device) -> Non
                 state[key] = value.to(device)
 
 
-def _data_contract(args: argparse.Namespace, storage_format: str) -> dict[str, Any]:
+def _data_contract(
+    args: argparse.Namespace,
+    storage_format: str,
+    effect_motion_scale: float,
+) -> dict[str, Any]:
     return {
         "data_root_dir": str(Path(args.data_root_dir).resolve()),
         "train_dataset_name": args.train_dataset_name,
@@ -201,6 +343,7 @@ def _data_contract(args: argparse.Namespace, storage_format: str) -> dict[str, A
         "action_dim": args.action_dim,
         "action_normalization": "per_dataset_q01_q99_to_minus1_plus1_except_gripper",
         "effect_descriptor": "sum_xyz_sum_rpy_final_minus_initial_gripper",
+        "effect_motion_scale": effect_motion_scale,
         "balance_weights": args.balance_weights,
     }
 
@@ -214,6 +357,7 @@ def _check_resume_contract(saved: dict[str, Any], current: dict[str, Any]) -> No
         "action_dim",
         "action_normalization",
         "effect_descriptor",
+        "effect_motion_scale",
         "balance_weights",
     )
     mismatches = [
@@ -253,12 +397,31 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-hidden-layers", type=int, default=2)
     parser.add_argument("--codebook-size", type=int, default=256)
     parser.add_argument("--gripper-weight", type=float, default=1.0)
+    parser.add_argument(
+        "--effect-motion-scale",
+        type=float,
+        default=None,
+        help="Scale accumulated XYZ/RPY; defaults to 1/horizon and is inverted at decode.",
+    )
     parser.add_argument("--codebook-loss-weight", type=float, default=1.0)
-    parser.add_argument("--commitment-loss-weight", type=float, default=0.25)
-    parser.add_argument("--usage-loss-weight", type=float, default=0.01)
-    parser.add_argument("--usage-temperature", type=float, default=1.0)
-    parser.add_argument("--lr", type=float, default=3e-4)
-    parser.add_argument("--min-lr", type=float, default=3e-5)
+    parser.add_argument("--commitment-loss-weight", type=float, default=1.0)
+    parser.add_argument("--usage-loss-weight", type=float, default=0.1)
+    parser.add_argument("--usage-temperature", type=float, default=0.1)
+    parser.add_argument("--codebook-init-samples", type=int, default=32_768)
+    parser.add_argument("--kmeans-init-iters", type=int, default=10)
+    parser.add_argument("--dead-code-ema-decay", type=float, default=0.99)
+    parser.add_argument(
+        "--dead-code-threshold",
+        type=float,
+        default=0.1,
+        help="Dead threshold as a fraction of uniform code probability (1/K).",
+    )
+    parser.add_argument("--dead-code-patience", type=int, default=100)
+    parser.add_argument("--dead-code-warmup-steps", type=int, default=500)
+    parser.add_argument("--dead-code-max-resets", type=int, default=32)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--min-lr", type=float, default=1e-5)
+    parser.add_argument("--codebook-lr-multiplier", type=float, default=2.0)
     parser.add_argument("--warmup-steps", type=int, default=1_000)
     parser.add_argument("--weight-decay", type=float, default=1e-5)
     parser.add_argument("--grad-clip-norm", type=float, default=1.0)
@@ -295,11 +458,16 @@ def parse_args() -> argparse.Namespace:
         "num_hidden_layers",
         "codebook_size",
         "gripper_weight",
+        "codebook_init_samples",
+        "kmeans_init_iters",
+        "dead_code_patience",
+        "dead_code_max_resets",
         "codebook_loss_weight",
         "commitment_loss_weight",
         "usage_temperature",
         "lr",
         "min_lr",
+        "codebook_lr_multiplier",
         "grad_clip_norm",
         "log_every_steps",
         "val_every_steps",
@@ -312,10 +480,23 @@ def parse_args() -> argparse.Namespace:
         parser.error(f"--action-dim must be {len(DESCRIPTOR_NAMES)}")
     if args.codebook_size < 2:
         parser.error("--codebook-size must be at least 2")
+    if args.codebook_init_samples < args.codebook_size:
+        parser.error("--codebook-init-samples must be at least --codebook-size")
     if args.val_samples > args.val_shuffle_buffer_size:
         parser.error("--val-samples cannot exceed --val-shuffle-buffer-size")
-    if args.warmup_steps < 0 or args.weight_decay < 0 or args.usage_loss_weight < 0:
-        parser.error("warmup, weight decay, and usage loss weight must be non-negative")
+    non_negative = (
+        args.warmup_steps,
+        args.weight_decay,
+        args.usage_loss_weight,
+        args.dead_code_threshold,
+        args.dead_code_warmup_steps,
+    )
+    if any(value < 0 for value in non_negative):
+        parser.error("warmup, decay, thresholds, and loss weights must be non-negative")
+    if args.effect_motion_scale is not None and args.effect_motion_scale <= 0:
+        parser.error("--effect-motion-scale must be positive")
+    if not 0 <= args.dead_code_ema_decay < 1:
+        parser.error("--dead-code-ema-decay must be in [0, 1)")
     if args.min_lr > args.lr:
         parser.error("--min-lr cannot exceed --lr")
     if args.rlds_traj_transform_threads < 0 or args.rlds_traj_read_threads < 0:
@@ -332,10 +513,17 @@ def main() -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     device = choose_device(args.device)
+    effect_motion_scale = (
+        float(args.effect_motion_scale)
+        if args.effect_motion_scale is not None
+        else 1.0 / args.horizon
+    )
+    effect_scale = (effect_motion_scale,) * 6 + (1.0,)
     _log(
-        "[1/5] building OpenX training stream with myStudy normalization: "
+        "[1/6] building OpenX training stream with myStudy normalization: "
         f"dataset={args.train_dataset_name} target={args.target_control_hz:g}Hz "
-        f"horizon={args.horizon} stride={args.sampling_stride}"
+        f"horizon={args.horizon} stride={args.sampling_stride} "
+        f"effect_motion_scale={effect_motion_scale:g}"
     )
     train_dataset = OXEActionDataset(
         args.data_root_dir,
@@ -370,25 +558,31 @@ def main() -> None:
         drop_last=True,
     )
     train_iterator = iter(train_loader)
-    data_contract = _data_contract(args, train_dataset.storage_format)
+    data_contract = _data_contract(
+        args,
+        train_dataset.storage_format,
+        effect_motion_scale,
+    )
 
     payload = None
     if args.resume:
-        _log(f"[2/5] loading full training state: {Path(args.resume).resolve()}")
+        _log(f"[2/6] loading full training state: {Path(args.resume).resolve()}")
         payload = load_effect_checkpoint(args.resume, map_location="cpu")
         _check_resume_contract(payload["config"]["data"], data_contract)
         tokenizer = EffectTokenizer.from_payload(payload)
         model = tokenizer.model.to(device)
         global_step = int(payload.get("global_step", 0))
         gripper_weight = tokenizer.gripper_weight
+        effect_scale = tokenizer.effect_scale
     else:
-        _log("[2/5] initializing a new single-codebook MLP VQ-VAE")
+        _log("[2/6] initializing a spherical single-codebook MLP VQ-VAE")
         model_config = MLPVQVAEConfig(
             input_dim=args.action_dim,
             hidden_dim=args.hidden_dim,
             latent_dim=args.latent_dim,
             num_hidden_layers=args.num_hidden_layers,
             codebook_size=args.codebook_size,
+            normalize_latents=True,
         )
         model = MLPEffectVQVAE(model_config).to(device)
         global_step = 0
@@ -401,6 +595,7 @@ def main() -> None:
     if payload is not None:
         saved_loss = payload["config"]["loss"]
         saved_optimization = payload["config"]["optimization"]
+        saved_quantizer = payload["config"]["quantizer"]
         codebook_loss_weight = float(saved_loss["codebook_loss_weight"])
         commitment_loss_weight = float(saved_loss["commitment_loss_weight"])
         usage_loss_weight = float(saved_loss["usage_loss_weight"])
@@ -411,6 +606,16 @@ def main() -> None:
         weight_decay = float(saved_optimization["weight_decay"])
         grad_clip_norm = float(saved_optimization["grad_clip_norm"])
         amp_dtype = str(saved_optimization["amp_dtype"])
+        codebook_lr_multiplier = float(
+            saved_optimization["codebook_lr_multiplier"]
+        )
+        dead_code_ema_decay = float(saved_quantizer["dead_code_ema_decay"])
+        dead_code_threshold = float(saved_quantizer["dead_code_threshold"])
+        dead_code_patience = int(saved_quantizer["dead_code_patience"])
+        dead_code_warmup_steps = int(saved_quantizer["dead_code_warmup_steps"])
+        dead_code_max_resets = int(saved_quantizer["dead_code_max_resets"])
+        codebook_init_samples = int(saved_quantizer["codebook_init_samples"])
+        kmeans_init_iters = int(saved_quantizer["kmeans_init_iters"])
     else:
         codebook_loss_weight = args.codebook_loss_weight
         commitment_loss_weight = args.commitment_loss_weight
@@ -422,9 +627,32 @@ def main() -> None:
         weight_decay = args.weight_decay
         grad_clip_norm = args.grad_clip_norm
         amp_dtype = args.amp_dtype
+        codebook_lr_multiplier = args.codebook_lr_multiplier
+        dead_code_ema_decay = args.dead_code_ema_decay
+        dead_code_threshold = args.dead_code_threshold
+        dead_code_patience = args.dead_code_patience
+        dead_code_warmup_steps = args.dead_code_warmup_steps
+        dead_code_max_resets = args.dead_code_max_resets
+        codebook_init_samples = args.codebook_init_samples
+        kmeans_init_iters = args.kmeans_init_iters
 
     optimizer = AdamW(
-        model.parameters(), lr=learning_rate, weight_decay=weight_decay
+        [
+            {
+                "params": [
+                    parameter
+                    for name, parameter in model.named_parameters()
+                    if name != "codebook.weight"
+                ],
+                "lr": learning_rate,
+                "weight_decay": weight_decay,
+            },
+            {
+                "params": [model.codebook.weight],
+                "lr": learning_rate * codebook_lr_multiplier,
+                "weight_decay": 0.0,
+            },
+        ]
     )
     scheduler = LambdaLR(
         optimizer,
@@ -444,7 +672,7 @@ def main() -> None:
             scaler.load_state_dict(payload["grad_scaler_state_dict"])
         _log(f"resumed at global_step={global_step}")
 
-    _log(f"[3/5] caching {args.val_samples} held-out effects for validation")
+    _log(f"[3/6] caching {args.val_samples} held-out effects for validation")
     val_dataset = OXEActionDataset(
         args.data_root_dir,
         args.train_dataset_name,
@@ -480,7 +708,52 @@ def main() -> None:
         val_loader,
         num_samples=args.val_samples,
         gripper_weight=gripper_weight,
+        effect_scale=effect_scale,
     )
+
+    initial_code_usage: np.ndarray | None = None
+    if payload is None:
+        _log(
+            f"[4/6] collecting {codebook_init_samples} effects and running "
+            f"{kmeans_init_iters} full latent K-means initialization iterations"
+        )
+        initialization_effects, train_iterator = _collect_training_effects(
+            train_loader,
+            train_iterator,
+            num_samples=codebook_init_samples,
+            gripper_weight=gripper_weight,
+            effect_scale=effect_scale,
+        )
+        initialization_counts = _initialize_codebook_from_effects(
+            model,
+            initialization_effects,
+            batch_size=args.batch_size,
+            device=device,
+            iterations=kmeans_init_iters,
+            seed=args.seed,
+        )
+        initial_code_usage = initialization_counts.astype(np.float32)
+        initial_metrics = _usage_metrics(initialization_counts)
+        _log(
+            "codebook initialization complete: "
+            f"ppl={initial_metrics['perplexity']:.1f} "
+            f"used={initial_metrics['used_codes']}/{model.codebook_size} "
+            f"H={initial_metrics['normalized_entropy']:.3f} "
+            f"top={initial_metrics['top_probability']:.3f}"
+        )
+
+    dead_code_tracker = DeadCodeTracker(
+        model.codebook_size,
+        decay=dead_code_ema_decay,
+        threshold=dead_code_threshold,
+        patience=dead_code_patience,
+        warmup_steps=dead_code_warmup_steps,
+        max_resets_per_step=dead_code_max_resets,
+        device=device,
+        initial_usage=initial_code_usage,
+    )
+    if payload is not None and payload.get("dead_code_tracker_state"):
+        dead_code_tracker.load_state_dict(payload["dead_code_tracker_state"])
 
     writer = None
     if args.tensorboard:
@@ -496,12 +769,23 @@ def main() -> None:
             "type": "mlp_effect_vqvae",
             **vars(model.config),
             "gripper_weight": gripper_weight,
+            "effect_scale": list(effect_scale),
         },
         "loss": {
             "codebook_loss_weight": codebook_loss_weight,
             "commitment_loss_weight": commitment_loss_weight,
             "usage_loss_weight": usage_loss_weight,
             "usage_temperature": usage_temperature,
+        },
+        "quantizer": {
+            "initialization": "full_kmeans_on_encoder_latents",
+            "codebook_init_samples": codebook_init_samples,
+            "kmeans_init_iters": kmeans_init_iters,
+            "dead_code_ema_decay": dead_code_ema_decay,
+            "dead_code_threshold": dead_code_threshold,
+            "dead_code_patience": dead_code_patience,
+            "dead_code_warmup_steps": dead_code_warmup_steps,
+            "dead_code_max_resets": dead_code_max_resets,
         },
         "optimization": {
             "lr": learning_rate,
@@ -511,6 +795,7 @@ def main() -> None:
             "weight_decay": weight_decay,
             "grad_clip_norm": grad_clip_norm,
             "amp_dtype": amp_dtype,
+            "codebook_lr_multiplier": codebook_lr_multiplier,
         },
         "seed": args.seed,
     }
@@ -518,11 +803,13 @@ def main() -> None:
         model=model,
         gripper_weight=gripper_weight,
         config=config,
+        effect_scale=effect_scale,
     )
 
     _log(
-        f"[4/5] training on {device}: steps={global_step + 1}..{args.total_steps} "
-        f"batch={args.batch_size} K={model.codebook_size} latent={model.config.latent_dim}"
+        f"[5/6] training on {device}: steps={global_step + 1}..{args.total_steps} "
+        f"batch={args.batch_size} K={model.codebook_size} latent={model.config.latent_dim} "
+        f"spherical=yes dead_threshold={dead_code_tracker.minimum_probability:.3g}"
     )
     window_sums = {
         "total": 0.0,
@@ -530,11 +817,17 @@ def main() -> None:
         "codebook": 0.0,
         "commitment": 0.0,
         "usage": 0.0,
+        "usage_balance": 0.0,
+        "assignment_entropy": 0.0,
         "margin": 0.0,
+        "encoder_norm": 0.0,
+        "codebook_norm": 0.0,
+        "quantization_rmse": 0.0,
         "grad": 0.0,
     }
     window_counts = np.zeros(model.codebook_size, dtype=np.int64)
     window_steps = 0
+    window_code_resets = 0
     log_started = time.perf_counter()
     last_validation: dict[str, float | int] | None = (
         payload.get("last_validation") if payload is not None else None
@@ -545,6 +838,7 @@ def main() -> None:
         effects = _actions_to_effect_tensor(
             actions,
             gripper_weight=gripper_weight,
+            effect_scale=effect_scale,
             device=device,
         )
         optimizer.zero_grad(set_to_none=True)
@@ -564,13 +858,42 @@ def main() -> None:
         )
         scaler.step(optimizer)
         scaler.update()
+        model.normalize_codebook_()
+        reset_codes = dead_code_tracker.update_and_reset(
+            model,
+            codes=output.codes,
+            encoder_latent=output.encoder_latent,
+            squared_distances=output.nearest_squared_distance,
+            optimizer=optimizer,
+        )
         scheduler.step()
         global_step += 1
 
-        for key in ("total", "reconstruction", "codebook", "commitment", "usage"):
+        for key in (
+            "total",
+            "reconstruction",
+            "codebook",
+            "commitment",
+            "usage",
+            "usage_balance",
+            "assignment_entropy",
+        ):
             window_sums[key] += float(losses[key].detach())
         window_sums["margin"] += float(output.relative_margin.detach().mean())
+        window_sums["encoder_norm"] += float(
+            output.encoder_latent.detach().float().norm(dim=-1).mean()
+        )
+        window_sums["codebook_norm"] += float(
+            model.normalized_codebook().detach().float().norm(dim=-1).mean()
+        )
+        window_sums["quantization_rmse"] += float(
+            torch.sqrt(
+                output.nearest_squared_distance.detach().float().mean()
+                / model.config.latent_dim
+            )
+        )
         window_sums["grad"] += float(grad_norm)
+        window_code_resets += len(reset_codes)
         window_counts += np.bincount(
             output.codes.detach().cpu().numpy(), minlength=model.codebook_size
         )
@@ -586,14 +909,19 @@ def main() -> None:
             }
             speed = window_steps / max(interval, 1e-8)
             eta = (args.total_steps - global_step) / max(speed, 1e-8)
+            dead_metrics = dead_code_tracker.metrics()
             _log(
                 f"step={global_step:07d}/{args.total_steps} "
                 f"lr={optimizer.param_groups[0]['lr']:.6g} "
                 f"loss={averages['total']:.5f} recon={averages['reconstruction']:.5f} "
                 f"codebook={averages['codebook']:.5f} commit={averages['commitment']:.5f} "
-                f"usage={averages['usage']:.4f} margin={averages['margin']:.3f} "
+                f"usage={averages['usage']:.4f} "
+                f"[bal={averages['usage_balance']:.3f},sharp={averages['assignment_entropy']:.3f}] "
+                f"margin={averages['margin']:.3f} qerr={averages['quantization_rmse']:.4f} "
                 f"ppl={usage['perplexity']:.1f} used={usage['used_codes']}/{model.codebook_size} "
                 f"H={usage['normalized_entropy']:.3f} top={usage['top_probability']:.3f} "
+                f"z={averages['encoder_norm']:.3f} cb={averages['codebook_norm']:.3f} "
+                f"dead={dead_metrics['ema_dead_codes']} reset={window_code_resets} "
                 f"grad={averages['grad']:.3f} speed={speed:.2f}step/s "
                 f"elapsed={_duration(elapsed)} eta={_duration(eta)}"
             )
@@ -603,9 +931,22 @@ def main() -> None:
                 for key, value in usage.items():
                     writer.add_scalar(f"train/{key}", value, global_step)
                 writer.add_scalar("train/lr", optimizer.param_groups[0]["lr"], global_step)
+                writer.add_scalar(
+                    "train/codebook_lr", optimizer.param_groups[1]["lr"], global_step
+                )
+                writer.add_scalar(
+                    "train/dead_codes", dead_metrics["ema_dead_codes"], global_step
+                )
+                writer.add_scalar("train/code_resets", window_code_resets, global_step)
+                writer.add_scalar(
+                    "train/total_code_resets",
+                    dead_metrics["total_code_resets"],
+                    global_step,
+                )
             window_sums = {key: 0.0 for key in window_sums}
             window_counts.fill(0)
             window_steps = 0
+            window_code_resets = 0
             log_started = time.perf_counter()
 
         if global_step % args.val_every_steps == 0 or global_step == args.total_steps:
@@ -625,7 +966,10 @@ def main() -> None:
                 f"ppl={last_validation['perplexity']:.1f} "
                 f"used={last_validation['used_codes']}/{model.codebook_size} "
                 f"H={last_validation['normalized_entropy']:.3f} "
-                f"top={last_validation['top_probability']:.3f}"
+                f"top={last_validation['top_probability']:.3f} "
+                f"qerr={last_validation['quantization_rmse']:.4f} "
+                f"z={last_validation['encoder_norm']:.3f} "
+                f"cb={last_validation['codebook_norm']:.3f}"
             )
             if writer is not None:
                 for key, value in last_validation.items():
@@ -636,12 +980,13 @@ def main() -> None:
             or global_step == args.total_steps
         )
         if should_save:
-            _log(f"[5/5] saving full training checkpoint at step {global_step}")
+            _log(f"[6/6] saving full training checkpoint at step {global_step}")
             training_state = {
                 "global_step": global_step,
                 "optimizer_state_dict": optimizer.state_dict(),
                 "scheduler_state_dict": scheduler.state_dict(),
                 "grad_scaler_state_dict": scaler.state_dict(),
+                "dead_code_tracker_state": dead_code_tracker.state_dict(),
                 "last_validation": last_validation,
             }
             numbered = output_dir / f"effect_vqvae-step-{global_step:07d}.pt"

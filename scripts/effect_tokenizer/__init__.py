@@ -2,6 +2,7 @@
 
 from .effect_tokenizer import (
     DESCRIPTOR_NAMES,
+    DeadCodeTracker,
     EffectTokenizer,
     MLPEffectVQVAE,
     MLPVQVAEConfig,
@@ -16,6 +17,7 @@ from .effect_tokenizer import (
 
 __all__ = [
     "DESCRIPTOR_NAMES",
+    "DeadCodeTracker",
     "EffectTokenizer",
     "MLPEffectVQVAE",
     "MLPVQVAEConfig",

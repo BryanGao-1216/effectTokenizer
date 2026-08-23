@@ -26,12 +26,21 @@ python scripts/effect_tokenizer/train_effect_tokenizer.py \
     --num-hidden-layers 2 \
     --codebook-size 256 \
     --gripper-weight 1.0 \
+    --effect-motion-scale 0.1 \
     --codebook-loss-weight 1.0 \
-    --commitment-loss-weight 0.25 \
-    --usage-loss-weight 0.01 \
-    --usage-temperature 1.0 \
-    --lr 3e-4 \
-    --min-lr 3e-5 \
+    --commitment-loss-weight 1.0 \
+    --usage-loss-weight 0.1 \
+    --usage-temperature 0.1 \
+    --codebook-init-samples 32768 \
+    --kmeans-init-iters 10 \
+    --dead-code-ema-decay 0.99 \
+    --dead-code-threshold 0.1 \
+    --dead-code-patience 100 \
+    --dead-code-warmup-steps 500 \
+    --dead-code-max-resets 32 \
+    --lr 1e-4 \
+    --min-lr 1e-5 \
+    --codebook-lr-multiplier 2.0 \
     --warmup-steps 1000 \
     --weight-decay 1e-5 \
     --grad-clip-norm 1.0 \
