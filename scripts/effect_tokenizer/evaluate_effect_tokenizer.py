@@ -254,6 +254,18 @@ def _cumulative(action: np.ndarray, start: int) -> np.ndarray:
     )
 
 
+_ASSIGNED_TRAJECTORY_COLORS = (
+    "#1e3a8a",
+    "#1d4ed8",
+    "#2563eb",
+    "#0369a1",
+    "#075985",
+    "#3730a3",
+    "#1e40af",
+    "#0e7490",
+)
+
+
 def _token_figure(
     *,
     code_id: int,
@@ -286,16 +298,20 @@ def _token_figure(
         position = _cumulative(action, 0)
         rotation = _cumulative(action, 3)
         name = f"assigned validation trajectories (shown={len(examples)})"
+        sample_color = _ASSIGNED_TRAJECTORY_COLORS[
+            sample_id % len(_ASSIGNED_TRAJECTORY_COLORS)
+        ]
         figure.add_trace(
             go.Scatter3d(
                 x=position[:, 0],
                 y=position[:, 1],
                 z=position[:, 2],
-                mode="lines",
+                mode="lines+markers",
                 name=name,
                 legendgroup="examples",
                 showlegend=sample_id == 0,
-                line={"color": "rgba(37,99,235,0.28)", "width": 3},
+                line={"color": sample_color, "width": 4},
+                marker={"color": sample_color, "size": 2.5, "opacity": 0.9},
                 hovertemplate=(
                     f"sample {sample_id}<br>step=%{{pointNumber}}<br>"
                     "XYZ=(%{x:.5f}, %{y:.5f}, %{z:.5f})<extra></extra>"
@@ -309,11 +325,12 @@ def _token_figure(
                 x=rotation[:, 0],
                 y=rotation[:, 1],
                 z=rotation[:, 2],
-                mode="lines",
+                mode="lines+markers",
                 name=name,
                 legendgroup="examples",
                 showlegend=False,
-                line={"color": "rgba(37,99,235,0.28)", "width": 3},
+                line={"color": sample_color, "width": 4},
+                marker={"color": sample_color, "size": 2.5, "opacity": 0.9},
                 hovertemplate=(
                     f"sample {sample_id}<br>step=%{{pointNumber}}<br>"
                     "RPY=(%{x:.5f}, %{y:.5f}, %{z:.5f})<extra></extra>"
@@ -327,12 +344,12 @@ def _token_figure(
             go.Scatter(
                 x=time_axis,
                 y=action[:, 6],
-                mode="lines",
+                mode="lines+markers",
                 name=name,
                 legendgroup="examples",
                 showlegend=False,
-                opacity=0.45,
-                line={"color": "#2563eb", "width": 1.5, "shape": "hv"},
+                line={"color": sample_color, "width": 2.5, "shape": "hv"},
+                marker={"color": sample_color, "size": 4, "opacity": 0.9},
                 hovertemplate=(
                     f"sample {sample_id}<br>t=%{{x:.3f}}s<br>"
                     "gripper=%{y:.4f}<extra></extra>"
