@@ -139,6 +139,23 @@ def stride(traj: Dict, sampling_stride: int) -> Dict:
     return tf.nest.map_structure(lambda value: tf.gather(value, indices), traj)
 
 
+def drop_incomplete_action_windows(traj: Dict, future_action_window_size: int) -> Dict:
+    """Drop tail windows that would require actions past the episode end."""
+    if future_action_window_size < 0:
+        raise ValueError(
+            "future_action_window_size must be non-negative, got "
+            f"{future_action_window_size}"
+        )
+    if future_action_window_size == 0:
+        return traj
+    trajectory_length = tf.shape(traj["action"])[0]
+    valid_length = tf.maximum(
+        trajectory_length - future_action_window_size,
+        0,
+    )
+    return tf.nest.map_structure(lambda value: value[:valid_length], traj)
+
+
 def add_pad_mask_dict(traj: Dict) -> Dict:
     """
     Adds a dictionary indicating which elements of the observation/task should be treated as padding.

@@ -630,6 +630,11 @@ def _write_summary(path: Path, metrics: dict[str, Any]) -> None:
         "- Actions are resampled before normalization and chunking.",
         "- Each dataset independently maps its action q01/q99 to [-1, 1], exactly as myStudy.",
         "- The gripper remains an absolute value; no pooled global z-score is fitted.",
+        (
+            "- Incomplete tail windows are stationary-padded."
+            if metrics["data"]["pad_incomplete_windows"]
+            else "- Incomplete tail windows are dropped."
+        ),
         "- A simple MLP encoder, one learned codebook, and an MLP decoder are trained jointly.",
         "",
         "## Sanity checks",
@@ -737,13 +742,17 @@ def main() -> None:
     _log(
         f"[2/7] building per-dataset q01/q99-normalized validation stream: "
         f"dataset={args.test_dataset_name} target_hz={data_config['target_control_hz']} "
-        f"horizon={data_config['horizon']} stride={data_config['sampling_stride']}"
+        f"horizon={data_config['horizon']} stride={data_config['sampling_stride']} "
+        f"pad_incomplete={data_config.get('pad_incomplete_windows', True)}"
     )
     dataset = OXEActionDataset(
         args.data_root_dir,
         args.test_dataset_name,
         horizon=int(data_config["horizon"]),
         sampling_stride=int(data_config["sampling_stride"]),
+        pad_incomplete_windows=bool(
+            data_config.get("pad_incomplete_windows", True)
+        ),
         target_control_hz=float(data_config["target_control_hz"]),
         action_dim=int(data_config["action_dim"]),
         train=False,
@@ -903,6 +912,9 @@ def main() -> None:
             "target_control_hz": data_config["target_control_hz"],
             "horizon": data_config["horizon"],
             "sampling_stride": data_config["sampling_stride"],
+            "pad_incomplete_windows": bool(
+                data_config.get("pad_incomplete_windows", True)
+            ),
         },
         "vqvae": result,
         "sanity_checks": _sanity_checks(

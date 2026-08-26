@@ -340,6 +340,7 @@ def _data_contract(
         "target_control_hz": args.target_control_hz,
         "horizon": args.horizon,
         "sampling_stride": args.sampling_stride,
+        "pad_incomplete_windows": args.pad_incomplete_windows,
         "action_dim": args.action_dim,
         "action_normalization": "per_dataset_q01_q99_to_minus1_plus1_except_gripper",
         "effect_descriptor": "sum_xyz_sum_rpy_final_minus_initial_gripper",
@@ -354,6 +355,7 @@ def _check_resume_contract(saved: dict[str, Any], current: dict[str, Any]) -> No
         "target_control_hz",
         "horizon",
         "sampling_stride",
+        "pad_incomplete_windows",
         "action_dim",
         "action_normalization",
         "effect_descriptor",
@@ -363,7 +365,11 @@ def _check_resume_contract(saved: dict[str, Any], current: dict[str, Any]) -> No
     mismatches = [
         f"{key}: checkpoint={saved.get(key)!r}, current={current.get(key)!r}"
         for key in keys
-        if saved.get(key) != current.get(key)
+        if saved.get(
+            key,
+            True if key == "pad_incomplete_windows" else None,
+        )
+        != current.get(key)
     ]
     if mismatches:
         raise ValueError(
@@ -386,6 +392,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-control-hz", type=float, default=10.0)
     parser.add_argument("--horizon", type=int, default=10)
     parser.add_argument("--sampling-stride", type=int, default=2)
+    parser.add_argument(
+        "--pad-incomplete-windows",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Keep short/tail windows by zero-padding relative motion and repeating "
+            "absolute values such as the gripper."
+        ),
+    )
     parser.add_argument("--action-dim", type=int, default=7)
     parser.add_argument("--shuffle-buffer-size", type=int, default=100_000)
     parser.add_argument("--val-shuffle-buffer-size", type=int, default=4_096)
@@ -523,6 +538,7 @@ def main() -> None:
         "[1/6] building OpenX training stream with myStudy normalization: "
         f"dataset={args.train_dataset_name} target={args.target_control_hz:g}Hz "
         f"horizon={args.horizon} stride={args.sampling_stride} "
+        f"pad_incomplete={args.pad_incomplete_windows} "
         f"effect_motion_scale={effect_motion_scale:g}"
     )
     train_dataset = OXEActionDataset(
@@ -530,6 +546,7 @@ def main() -> None:
         args.train_dataset_name,
         horizon=args.horizon,
         sampling_stride=args.sampling_stride,
+        pad_incomplete_windows=args.pad_incomplete_windows,
         target_control_hz=args.target_control_hz,
         action_dim=args.action_dim,
         train=True,
@@ -678,6 +695,7 @@ def main() -> None:
         args.train_dataset_name,
         horizon=args.horizon,
         sampling_stride=args.sampling_stride,
+        pad_incomplete_windows=args.pad_incomplete_windows,
         target_control_hz=args.target_control_hz,
         action_dim=args.action_dim,
         train=False,

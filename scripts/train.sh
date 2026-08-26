@@ -15,6 +15,7 @@ python scripts/effect_tokenizer/train_effect_tokenizer.py \
     --target-control-hz 10 \
     --horizon 10 \
     --sampling-stride 2 \
+    --pad-incomplete-windows \
     --action-dim 7 \
     --shuffle-buffer-size 100000 \
     --val-shuffle-buffer-size 4096 \

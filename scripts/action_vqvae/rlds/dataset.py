@@ -425,6 +425,7 @@ def apply_trajectory_transforms(
     window_size: int = 1,
     future_action_window_size: int = 0,
     sampling_stride: int = 1,
+    pad_incomplete_action_windows: bool = True,
     subsample_length: Optional[int] = None,
     skip_unlabeled: bool = False,
     max_action: Optional[float] = None,
@@ -453,6 +454,9 @@ def apply_trajectory_transforms(
         future_action_window_size (int, optional): The number of future actions beyond window_size to include
             in the chunked actions.
         sampling_stride (int, optional): Keep one chunk start every this many trajectory steps after chunking.
+        pad_incomplete_action_windows (bool, optional): If True, keep tail windows and pad relative
+            actions with zero while repeating absolute actions. If False, drop windows that extend
+            past the end of an episode.
         subsample_length (int, optional): If provided, trajectories longer than this will be subsampled to
             this length (after goal relabeling and chunking).
         skip_unlabeled (bool, optional): Whether to skip trajectories with no language labels.
@@ -477,6 +481,13 @@ def apply_trajectory_transforms(
 
     if max_proprio is not None and "proprio" in dataset.element_spec["observation"]:
         dataset = dataset.filter(lambda x: tf.math.reduce_all(tf.math.abs(x["observation"]["proprio"]) <= max_proprio))
+
+    if not pad_incomplete_action_windows and future_action_window_size > 0:
+        minimum_episode_length = future_action_window_size + 1
+        dataset = dataset.filter(
+            lambda trajectory: tf.shape(trajectory["action"])[0]
+            >= minimum_episode_length
+        )
 
     # marks which entires of the observation and task dicts are padding
     dataset = dataset.traj_map(traj_transforms.add_pad_mask_dict, num_parallel_calls)
@@ -520,8 +531,17 @@ def apply_trajectory_transforms(
             num_parallel_calls,
         )
 
+    if not pad_incomplete_action_windows:
+        dataset = dataset.traj_map(
+            partial(
+                traj_transforms.drop_incomplete_action_windows,
+                future_action_window_size=future_action_window_size,
+            ),
+            num_parallel_calls,
+        )
+
     # Stride after chunking so each retained item is still a full future-action
-    # window. Tail positions inside that window have already been neutral-padded.
+    # window. Incomplete tails have already been neutral-padded or removed.
     if sampling_stride <= 0:
         raise ValueError(f"sampling_stride must be positive, got {sampling_stride}")
     if sampling_stride > 1:

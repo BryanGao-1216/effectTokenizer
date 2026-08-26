@@ -19,6 +19,7 @@ from torch import Tensor
 from torch.utils.data import IterableDataset, get_worker_info
 
 if __package__:
+    from .action_window import extract_action_window
     from .rlds import make_interleaved_action_dataset
     from .rlds.frequency_resampling import (
         CONTROL_FREQUENCY_RESAMPLER_VERSION,
@@ -39,6 +40,7 @@ if __package__:
         transform_openx_tar_episode,
     )
 else:  # Support direct execution of train_action_vqvae.py.
+    from action_window import extract_action_window
     from rlds import make_interleaved_action_dataset
     from rlds.frequency_resampling import (
         CONTROL_FREQUENCY_RESAMPLER_VERSION,
@@ -70,6 +72,7 @@ class OXEActionDataset(IterableDataset[tuple[Tensor]]):
         *,
         horizon: int,
         sampling_stride: int | None = None,
+        pad_incomplete_windows: bool = True,
         target_control_hz: float | None = None,
         action_dim: int = 7,
         train: bool = True,
@@ -110,6 +113,7 @@ class OXEActionDataset(IterableDataset[tuple[Tensor]]):
         self.data_mix = data_mix
         self.horizon = int(horizon)
         self.sampling_stride = int(sampling_stride)
+        self.pad_incomplete_windows = bool(pad_incomplete_windows)
         self.target_control_hz = (
             None if target_control_hz is None else float(target_control_hz)
         )
@@ -245,6 +249,7 @@ class OXEActionDataset(IterableDataset[tuple[Tensor]]):
                     "window_size": 1,
                     "future_action_window_size": self.horizon - 1,
                     "sampling_stride": self.sampling_stride,
+                    "pad_incomplete_action_windows": self.pad_incomplete_windows,
                     "skip_unlabeled": False,
                     "goal_relabeling_strategy": None,
                 },
@@ -473,23 +478,24 @@ class OXEActionDataset(IterableDataset[tuple[Tensor]]):
                 normalized = np.where(minimum == maximum, 0.0, normalized).astype(
                     np.float32
                 )
-                frame_indices = np.arange(
-                    0, normalized.shape[0], self.sampling_stride
+                frame_stop = (
+                    normalized.shape[0]
+                    if self.pad_incomplete_windows
+                    else max(normalized.shape[0] - self.horizon + 1, 0)
                 )
+                frame_indices = np.arange(0, frame_stop, self.sampling_stride)
                 if self.train:
                     frame_rng.shuffle(frame_indices)
                 for frame_index in frame_indices:
-                    chunk_indices = np.arange(frame_index, frame_index + self.horizon)
-                    past_end = chunk_indices >= normalized.shape[0]
-                    chunk = normalized[
-                        np.minimum(chunk_indices, normalized.shape[0] - 1)
-                    ].copy()
-                    if np.any(past_end):
-                        chunk[past_end] = np.where(
-                            absolute_action_mask,
-                            chunk[past_end],
-                            np.zeros_like(chunk[past_end]),
-                        )
+                    chunk = extract_action_window(
+                        normalized,
+                        start=int(frame_index),
+                        horizon=self.horizon,
+                        absolute_action_mask=absolute_action_mask,
+                        pad_incomplete=self.pad_incomplete_windows,
+                    )
+                    if chunk is None:
+                        continue
                     yielded = True
                     yield chunk
             if not yielded:
@@ -623,7 +629,9 @@ class OXEActionDataset(IterableDataset[tuple[Tensor]]):
             f"rlds:{self.data_mix} storage={self.storage_format} split={split} datasets=[{datasets}] "
             f"estimated_samples={self.dataset_length} horizon={self.horizon} "
             f"target_control_hz={self.target_control_hz or 'native'} "
-            f"sampling_stride={self.sampling_stride} action_dim={self.action_dim}"
+            f"sampling_stride={self.sampling_stride} "
+            f"pad_incomplete_windows={self.pad_incomplete_windows} "
+            f"action_dim={self.action_dim}"
         )
 
     @property
