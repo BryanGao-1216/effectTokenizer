@@ -66,8 +66,11 @@ def _usage_metrics(counts: np.ndarray) -> dict[str, float | int]:
 
 def _next_batch(
     loader: DataLoader,
-    iterator: Iterator[tuple[Tensor]],
-) -> tuple[tuple[Tensor], Iterator[tuple[Tensor]]]:
+    iterator: Iterator[tuple[Tensor, Tensor, Tensor]],
+) -> tuple[
+    tuple[Tensor, Tensor, Tensor],
+    Iterator[tuple[Tensor, Tensor, Tensor]],
+]:
     try:
         return next(iterator), iterator
     except StopIteration:
@@ -122,7 +125,7 @@ def _collect_validation_effects(
 ) -> np.ndarray:
     chunks: list[np.ndarray] = []
     collected = 0
-    for actions, in loader:
+    for actions, _, _ in loader:
         remaining = num_samples - collected
         values = actions.numpy().astype(np.float32, copy=False)[:remaining]
         descriptors = compute_effect_descriptors(values)
@@ -139,16 +142,16 @@ def _collect_validation_effects(
 
 def _collect_training_effects(
     loader: DataLoader,
-    iterator: Iterator[tuple[Tensor]],
+    iterator: Iterator[tuple[Tensor, Tensor, Tensor]],
     *,
     num_samples: int,
     gripper_weight: float,
     effect_scale: tuple[float, ...],
-) -> tuple[np.ndarray, Iterator[tuple[Tensor]]]:
+) -> tuple[np.ndarray, Iterator[tuple[Tensor, Tensor, Tensor]]]:
     chunks: list[np.ndarray] = []
     collected = 0
     while collected < num_samples:
-        (actions,), iterator = _next_batch(loader, iterator)
+        (actions, _, _), iterator = _next_batch(loader, iterator)
         remaining = num_samples - collected
         descriptors = compute_effect_descriptors(
             actions.numpy().astype(np.float32, copy=False)[:remaining]
@@ -334,12 +337,12 @@ def _data_contract(
     effect_motion_scale: float,
 ) -> dict[str, Any]:
     return {
+        "window_contract_version": 2,
         "data_root_dir": str(Path(args.data_root_dir).resolve()),
         "train_dataset_name": args.train_dataset_name,
         "rlds_storage_format": storage_format,
-        "target_control_hz": args.target_control_hz,
-        "horizon": args.horizon,
-        "sampling_stride": args.sampling_stride,
+        "window_duration_seconds": args.window_duration_seconds,
+        "sampling_stride_seconds": args.sampling_stride_seconds,
         "pad_incomplete_windows": args.pad_incomplete_windows,
         "action_dim": args.action_dim,
         "action_normalization": "per_dataset_q01_q99_to_minus1_plus1_except_gripper",
@@ -351,10 +354,10 @@ def _data_contract(
 
 def _check_resume_contract(saved: dict[str, Any], current: dict[str, Any]) -> None:
     keys = (
+        "window_contract_version",
         "train_dataset_name",
-        "target_control_hz",
-        "horizon",
-        "sampling_stride",
+        "window_duration_seconds",
+        "sampling_stride_seconds",
         "pad_incomplete_windows",
         "action_dim",
         "action_normalization",
@@ -389,9 +392,13 @@ def parse_args() -> argparse.Namespace:
         choices=("auto", "tfds", "webdataset", "hybrid"),
         default="auto",
     )
-    parser.add_argument("--target-control-hz", type=float, default=10.0)
-    parser.add_argument("--horizon", type=int, default=10)
-    parser.add_argument("--sampling-stride", type=int, default=2)
+    parser.add_argument("--window-duration-seconds", type=float, default=1.0)
+    parser.add_argument(
+        "--sampling-stride-seconds",
+        type=float,
+        default=None,
+        help="Time between window starts; defaults to one quarter of the window duration.",
+    )
     parser.add_argument(
         "--pad-incomplete-windows",
         action=argparse.BooleanOptionalAction,
@@ -416,7 +423,7 @@ def parse_args() -> argparse.Namespace:
         "--effect-motion-scale",
         type=float,
         default=None,
-        help="Scale accumulated XYZ/RPY; defaults to 1/horizon and is inverted at decode.",
+        help="Scale accumulated XYZ/RPY for model conditioning; defaults to 0.1 and is inverted at decode.",
     )
     parser.add_argument("--codebook-loss-weight", type=float, default=1.0)
     parser.add_argument("--commitment-loss-weight", type=float, default=1.0)
@@ -459,9 +466,7 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
 
     positive = (
-        "target_control_hz",
-        "horizon",
-        "sampling_stride",
+        "window_duration_seconds",
         "action_dim",
         "shuffle_buffer_size",
         "val_shuffle_buffer_size",
@@ -510,6 +515,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("warmup, decay, thresholds, and loss weights must be non-negative")
     if args.effect_motion_scale is not None and args.effect_motion_scale <= 0:
         parser.error("--effect-motion-scale must be positive")
+    if args.sampling_stride_seconds is None:
+        args.sampling_stride_seconds = args.window_duration_seconds / 4.0
+    if args.sampling_stride_seconds <= 0:
+        parser.error("--sampling-stride-seconds must be positive")
     if not 0 <= args.dead_code_ema_decay < 1:
         parser.error("--dead-code-ema-decay must be in [0, 1)")
     if args.min_lr > args.lr:
@@ -531,23 +540,23 @@ def main() -> None:
     effect_motion_scale = (
         float(args.effect_motion_scale)
         if args.effect_motion_scale is not None
-        else 1.0 / args.horizon
+        else 0.1
     )
     effect_scale = (effect_motion_scale,) * 6 + (1.0,)
     _log(
         "[1/6] building OpenX training stream with myStudy normalization: "
-        f"dataset={args.train_dataset_name} target={args.target_control_hz:g}Hz "
-        f"horizon={args.horizon} stride={args.sampling_stride} "
+        f"dataset={args.train_dataset_name} "
+        f"window={args.window_duration_seconds:g}s "
+        f"stride={args.sampling_stride_seconds:g}s native_rate=yes "
         f"pad_incomplete={args.pad_incomplete_windows} "
         f"effect_motion_scale={effect_motion_scale:g}"
     )
     train_dataset = OXEActionDataset(
         args.data_root_dir,
         args.train_dataset_name,
-        horizon=args.horizon,
-        sampling_stride=args.sampling_stride,
+        window_duration_seconds=args.window_duration_seconds,
+        sampling_stride_seconds=args.sampling_stride_seconds,
         pad_incomplete_windows=args.pad_incomplete_windows,
-        target_control_hz=args.target_control_hz,
         action_dim=args.action_dim,
         train=True,
         shuffle_buffer_size=args.shuffle_buffer_size,
@@ -693,10 +702,9 @@ def main() -> None:
     val_dataset = OXEActionDataset(
         args.data_root_dir,
         args.train_dataset_name,
-        horizon=args.horizon,
-        sampling_stride=args.sampling_stride,
+        window_duration_seconds=args.window_duration_seconds,
+        sampling_stride_seconds=args.sampling_stride_seconds,
         pad_incomplete_windows=args.pad_incomplete_windows,
-        target_control_hz=args.target_control_hz,
         action_dim=args.action_dim,
         train=False,
         shuffle_buffer_size=args.val_shuffle_buffer_size,
@@ -852,7 +860,9 @@ def main() -> None:
     )
 
     while global_step < args.total_steps:
-        (actions,), train_iterator = _next_batch(train_loader, train_iterator)
+        (actions, _, _), train_iterator = _next_batch(
+            train_loader, train_iterator
+        )
         effects = _actions_to_effect_tensor(
             actions,
             gripper_weight=gripper_weight,

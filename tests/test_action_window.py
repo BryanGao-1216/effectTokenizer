@@ -3,8 +3,13 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from scripts.action_vqvae.action_window import extract_action_window
+from scripts.action_vqvae.action_window import (
+    extract_action_window,
+    frames_for_duration,
+    frames_for_stride,
+)
 from scripts.effect_tokenizer.train_effect_tokenizer import _check_resume_contract
+from scripts.effect_tokenizer.effect_tokenizer import compute_effect_descriptors
 
 
 def test_short_episode_is_stationary_padded() -> None:
@@ -59,12 +64,40 @@ def test_complete_window_is_not_modified() -> None:
     np.testing.assert_array_equal(chunk, actions[1:4])
 
 
-def test_legacy_checkpoint_defaults_to_padding_enabled() -> None:
+def test_duration_is_converted_per_native_frequency() -> None:
+    assert frames_for_duration(1.0, 20.0) == 20
+    assert frames_for_duration(1.0, 10.0) == 10
+    assert frames_for_duration(1.0, 12.5) == 13
+    assert frames_for_stride(0.25, 20.0) == 5
+    assert frames_for_stride(0.25, 10.0) == 2
+    assert frames_for_stride(0.25, 3.0) == 1
+
+
+def test_batch_only_padding_does_not_change_endpoint_effect() -> None:
+    native = np.zeros((10, 7), dtype=np.float32)
+    native[:, 0] = 0.1
+    native[:, 3] = -0.2
+    native[:, 6] = np.linspace(0.0, 1.0, 10)
+    padded = extract_action_window(
+        native,
+        start=0,
+        horizon=20,
+        absolute_action_mask=np.asarray([False] * 6 + [True]),
+        pad_incomplete=True,
+    )
+
+    np.testing.assert_allclose(
+        compute_effect_descriptors(native),
+        compute_effect_descriptors(padded),
+    )
+
+
+def test_resume_contract_requires_time_window_semantics() -> None:
     saved = {
+        "window_contract_version": 2,
         "train_dataset_name": "toy",
-        "target_control_hz": 10.0,
-        "horizon": 10,
-        "sampling_stride": 2,
+        "window_duration_seconds": 1.0,
+        "sampling_stride_seconds": 0.25,
         "action_dim": 7,
         "action_normalization": "q01_q99",
         "effect_descriptor": "effect",
@@ -80,3 +113,18 @@ def test_legacy_checkpoint_defaults_to_padding_enabled() -> None:
             saved,
             {**current, "pad_incomplete_windows": False},
         )
+
+    legacy = {
+        "train_dataset_name": "toy",
+        "target_control_hz": 10.0,
+        "horizon": 10,
+        "sampling_stride": 2,
+        "pad_incomplete_windows": True,
+        "action_dim": 7,
+        "action_normalization": "q01_q99",
+        "effect_descriptor": "effect",
+        "effect_motion_scale": 0.1,
+        "balance_weights": True,
+    }
+    with pytest.raises(ValueError, match="window_contract_version"):
+        _check_resume_contract(legacy, current)

@@ -156,6 +156,62 @@ def drop_incomplete_action_windows(traj: Dict, future_action_window_size: int) -
     return tf.nest.map_structure(lambda value: value[:valid_length], traj)
 
 
+def pad_action_chunks(traj: Dict, output_action_window_size: int) -> Dict:
+    """Pad native-rate action chunks to one batch-compatible tensor length.
+
+    The chunk has already been constructed at the source dataset's native
+    frequency. Padding here is representation-only: relative motion is zero
+    and absolute dimensions repeat their last value, so endpoint effects are
+    unchanged. ``action_window_length`` records how many leading frames belong
+    to the requested time window and lets evaluation ignore this batch padding.
+    """
+    if output_action_window_size <= 0:
+        raise ValueError(
+            "output_action_window_size must be positive, got "
+            f"{output_action_window_size}"
+        )
+    actions = traj["action"]
+    trajectory_length = tf.shape(actions)[0]
+    action_window_length = tf.shape(actions)[1]
+    action_dim = actions.shape[-1]
+    padding_length = output_action_window_size - action_window_length
+    with tf.control_dependencies(
+        [
+            tf.debugging.assert_greater_equal(
+                padding_length,
+                0,
+                message="output action window cannot be shorter than native window",
+            )
+        ]
+    ):
+        padding_length = tf.identity(padding_length)
+
+    absolute_action_mask = traj.get(
+        "absolute_action_mask",
+        tf.zeros([trajectory_length, action_dim], dtype=tf.bool),
+    )
+    last_action = actions[:, -1:, :]
+    neutral_action = tf.where(
+        absolute_action_mask[:, None, :],
+        last_action,
+        tf.zeros_like(last_action),
+    )
+    padding = tf.tile(
+        neutral_action,
+        tf.stack([1, padding_length, 1]),
+    )
+    actions = tf.concat([actions, padding], axis=1)
+    actions = tf.ensure_shape(
+        actions,
+        [None, output_action_window_size, action_dim],
+    )
+    traj["action"] = actions
+    traj["action_window_length"] = tf.fill(
+        [trajectory_length], action_window_length
+    )
+    return traj
+
+
 def add_pad_mask_dict(traj: Dict) -> Dict:
     """
     Adds a dictionary indicating which elements of the observation/task should be treated as padding.

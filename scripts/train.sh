@@ -12,9 +12,8 @@ python scripts/effect_tokenizer/train_effect_tokenizer.py \
     --data-root-dir /mnt/data27T/media/gwb/datasets/OpenX \
     --train-dataset-name action_tokenizer_plus \
     --rlds-storage-format hybrid \
-    --target-control-hz 10 \
-    --horizon 10 \
-    --sampling-stride 2 \
+    --window-duration-seconds 1.0 \
+    --sampling-stride-seconds 0.25 \
     --pad-incomplete-windows \
     --action-dim 7 \
     --shuffle-buffer-size 100000 \

@@ -64,16 +64,26 @@ def _collect_actions(
     *,
     num_samples: int,
     log_every_batches: int,
-) -> np.ndarray:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     chunks: list[np.ndarray] = []
+    window_lengths: list[np.ndarray] = []
+    source_frequencies: list[np.ndarray] = []
     collected = 0
     started = time.perf_counter()
-    for batch_index, (actions,) in enumerate(loader, start=1):
+    for batch_index, (actions, lengths, frequencies) in enumerate(
+        loader, start=1
+    ):
         remaining = num_samples - collected
         if remaining <= 0:
             break
         values = actions.numpy().astype(np.float32, copy=False)[:remaining]
         chunks.append(values.copy())
+        window_lengths.append(
+            lengths.numpy().astype(np.int64, copy=False)[:remaining].copy()
+        )
+        source_frequencies.append(
+            frequencies.numpy().astype(np.float32, copy=False)[:remaining].copy()
+        )
         collected += len(values)
         if (
             batch_index == 1
@@ -95,7 +105,11 @@ def _collect_actions(
         raise ValueError(
             f"Validation stream returned {collected} samples, fewer than {num_samples}."
         )
-    return np.concatenate(chunks, axis=0)
+    return (
+        np.concatenate(chunks, axis=0),
+        np.concatenate(window_lengths, axis=0),
+        np.concatenate(source_frequencies, axis=0),
+    )
 
 
 def _usage_metrics(labels: np.ndarray, codebook_size: int) -> dict[str, Any]:
@@ -222,29 +236,38 @@ def _sanity_checks(
 
 def _trajectory_samples(
     actions: np.ndarray,
+    window_lengths: np.ndarray,
+    source_frequencies: np.ndarray,
     labels: np.ndarray,
     *,
     codebook_size: int,
     examples_per_token: int,
     seed: int,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     rng = np.random.default_rng(seed)
     examples = np.zeros(
         (codebook_size, examples_per_token, *actions.shape[1:]), dtype=np.float32
     )
     example_counts = np.zeros(codebook_size, dtype=np.int64)
-    mean_actions = np.zeros((codebook_size, *actions.shape[1:]), dtype=np.float64)
-    counts = np.bincount(labels, minlength=codebook_size)
+    example_lengths = np.zeros(
+        (codebook_size, examples_per_token), dtype=np.int64
+    )
+    example_frequencies = np.zeros(
+        (codebook_size, examples_per_token), dtype=np.float32
+    )
     for code_id in range(codebook_size):
         indices = np.flatnonzero(labels == code_id)
         if len(indices) == 0:
             continue
-        mean_actions[code_id] = actions[indices].mean(axis=0, dtype=np.float64)
         selected_count = min(examples_per_token, len(indices))
         selected = rng.choice(indices, size=selected_count, replace=False)
         examples[code_id, :selected_count] = actions[selected]
+        example_lengths[code_id, :selected_count] = window_lengths[selected]
+        example_frequencies[code_id, :selected_count] = source_frequencies[
+            selected
+        ]
         example_counts[code_id] = selected_count
-    return examples, example_counts, mean_actions.astype(np.float32)
+    return examples, example_counts, example_lengths, example_frequencies
 
 
 def _cumulative(action: np.ndarray, start: int) -> np.ndarray:
@@ -272,8 +295,8 @@ def _token_figure(
     raw_center: np.ndarray,
     assigned_count: int,
     examples: np.ndarray,
-    mean_action: np.ndarray,
-    target_control_hz: float,
+    example_lengths: np.ndarray,
+    example_frequencies: np.ndarray,
 ) -> Any:
     try:
         import plotly.graph_objects as go
@@ -294,7 +317,10 @@ def _token_figure(
         ),
         horizontal_spacing=0.045,
     )
-    for sample_id, action in enumerate(examples):
+    for sample_id, (padded_action, window_length, source_hz) in enumerate(
+        zip(examples, example_lengths, example_frequencies, strict=True)
+    ):
+        action = padded_action[: int(window_length)]
         position = _cumulative(action, 0)
         rotation = _cumulative(action, 3)
         name = f"assigned validation trajectories (shown={len(examples)})"
@@ -339,7 +365,7 @@ def _token_figure(
             row=1,
             col=2,
         )
-        time_axis = np.arange(action.shape[0], dtype=np.float32) / target_control_hz
+        time_axis = np.arange(action.shape[0], dtype=np.float32) / float(source_hz)
         figure.add_trace(
             go.Scatter(
                 x=time_axis,
@@ -354,51 +380,6 @@ def _token_figure(
                     f"sample {sample_id}<br>t=%{{x:.3f}}s<br>"
                     "gripper=%{y:.4f}<extra></extra>"
                 ),
-            ),
-            row=1,
-            col=3,
-        )
-
-    if assigned_count > 0:
-        mean_position = _cumulative(mean_action, 0)
-        mean_rotation = _cumulative(mean_action, 3)
-        for column, curve, coordinates in (
-            (1, mean_position, "XYZ"),
-            (2, mean_rotation, "RPY"),
-        ):
-            figure.add_trace(
-                go.Scatter3d(
-                    x=curve[:, 0],
-                    y=curve[:, 1],
-                    z=curve[:, 2],
-                    mode="lines+markers",
-                    name="mean assigned trajectory",
-                    legendgroup="mean",
-                    showlegend=column == 1,
-                    line={"color": "#dc2626", "width": 7},
-                    marker={"color": "#dc2626", "size": 3},
-                    hovertemplate=(
-                        f"mean<br>step=%{{pointNumber}}<br>{coordinates}="
-                        "(%{x:.5f}, %{y:.5f}, %{z:.5f})<extra></extra>"
-                    ),
-                ),
-                row=1,
-                col=column,
-            )
-        time_axis = (
-            np.arange(mean_action.shape[0], dtype=np.float32) / target_control_hz
-        )
-        figure.add_trace(
-            go.Scatter(
-                x=time_axis,
-                y=mean_action[:, 6],
-                mode="lines+markers",
-                name="mean assigned trajectory",
-                legendgroup="mean",
-                showlegend=False,
-                line={"color": "#dc2626", "width": 4, "shape": "hv"},
-                marker={"color": "#dc2626", "size": 5},
-                hovertemplate="mean<br>t=%{x:.3f}s<br>gripper=%{y:.4f}<extra></extra>",
             ),
             row=1,
             col=3,
@@ -433,7 +414,7 @@ def _token_figure(
         title={
             "text": (
                 f"Effect token {code_id:03d}<br><sup>assigned={assigned_count} · "
-                        f"shown={len(examples)} · decoded Δgripper={raw_center[6]:.4f}</sup>"
+                f"shown={len(examples)} · decoded Δgripper={raw_center[6]:.4f}</sup>"
             ),
             "x": 0.5,
             "xanchor": "center",
@@ -727,6 +708,11 @@ def main() -> None:
     tokenizer = EffectTokenizer.from_payload(payload)
     config = tokenizer.config
     data_config = config["data"]
+    if data_config.get("window_contract_version") != 2:
+        raise ValueError(
+            "This checkpoint uses the removed fixed-Hz preprocessing contract. "
+            "Evaluate a checkpoint trained with native-rate fixed-duration windows."
+        )
     device = choose_device(args.device)
     _log(
         f"VQ-VAE loaded: K={tokenizer.codebook_size} latent={tokenizer.latent_dim} "
@@ -741,19 +727,19 @@ def main() -> None:
         pass
     _log(
         f"[2/7] building per-dataset q01/q99-normalized validation stream: "
-        f"dataset={args.test_dataset_name} target_hz={data_config['target_control_hz']} "
-        f"horizon={data_config['horizon']} stride={data_config['sampling_stride']} "
+        f"dataset={args.test_dataset_name} native_rate=yes "
+        f"window={data_config['window_duration_seconds']}s "
+        f"stride={data_config['sampling_stride_seconds']}s "
         f"pad_incomplete={data_config.get('pad_incomplete_windows', True)}"
     )
     dataset = OXEActionDataset(
         args.data_root_dir,
         args.test_dataset_name,
-        horizon=int(data_config["horizon"]),
-        sampling_stride=int(data_config["sampling_stride"]),
+        window_duration_seconds=float(data_config["window_duration_seconds"]),
+        sampling_stride_seconds=float(data_config["sampling_stride_seconds"]),
         pad_incomplete_windows=bool(
             data_config.get("pad_incomplete_windows", True)
         ),
-        target_control_hz=float(data_config["target_control_hz"]),
         action_dim=int(data_config["action_dim"]),
         train=False,
         shuffle_buffer_size=args.num_samples,
@@ -780,7 +766,7 @@ def main() -> None:
         pin_memory=torch.cuda.is_available(),
         drop_last=False,
     )
-    actions = _collect_actions(
+    actions, window_lengths, source_frequencies = _collect_actions(
         loader,
         num_samples=args.num_samples,
         log_every_batches=args.log_every_batches,
@@ -817,8 +803,10 @@ def main() -> None:
     _log(
         f"[4/7] selecting up to {args.examples_per_token} trajectories per token"
     )
-    examples, example_counts, mean_actions = _trajectory_samples(
+    examples, example_counts, example_lengths, example_frequencies = _trajectory_samples(
         actions,
+        window_lengths,
+        source_frequencies,
         labels,
         codebook_size=tokenizer.codebook_size,
         examples_per_token=args.examples_per_token,
@@ -838,8 +826,8 @@ def main() -> None:
             raw_center=tokenizer.raw_centers[code_id],
             assigned_count=int(usage["counts"][code_id]),
             examples=examples[code_id, :shown],
-            mean_action=mean_actions[code_id],
-            target_control_hz=float(data_config["target_control_hz"]),
+            example_lengths=example_lengths[code_id, :shown],
+            example_frequencies=example_frequencies[code_id, :shown],
         )
         figure.write_html(
             trajectory_dir / f"token_{code_id:03d}.html",
@@ -886,7 +874,8 @@ def main() -> None:
         output_dir / "trajectory_examples.npz",
         actions=examples,
         example_counts=example_counts,
-        mean_actions=mean_actions,
+        example_window_lengths=example_lengths,
+        example_source_control_hz=example_frequencies,
         decoded_effect_prototypes=tokenizer.raw_centers,
         reconstructed_effects=reconstruction,
         assignment_counts=np.asarray(usage["counts"]),
@@ -909,9 +898,9 @@ def main() -> None:
             "samples": len(actions),
             "dataset_summary": dataset.summary(),
             "preprocessing": "per_dataset_q01_q99_to_minus1_plus1_except_gripper",
-            "target_control_hz": data_config["target_control_hz"],
-            "horizon": data_config["horizon"],
-            "sampling_stride": data_config["sampling_stride"],
+            "window_contract_version": data_config["window_contract_version"],
+            "window_duration_seconds": data_config["window_duration_seconds"],
+            "sampling_stride_seconds": data_config["sampling_stride_seconds"],
             "pad_incomplete_windows": bool(
                 data_config.get("pad_incomplete_windows", True)
             ),

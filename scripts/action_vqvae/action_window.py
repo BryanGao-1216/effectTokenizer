@@ -5,6 +5,28 @@ from __future__ import annotations
 import numpy as np
 
 
+def frames_for_duration(duration_seconds: float, control_hz: float) -> int:
+    """Convert a physical duration to the nearest positive native frame count."""
+    if duration_seconds <= 0:
+        raise ValueError(
+            f"duration_seconds must be positive, got {duration_seconds}."
+        )
+    if control_hz <= 0:
+        raise ValueError(f"control_hz must be positive, got {control_hz}.")
+    # Round half up rather than using Python's banker rounding. A nominal
+    # 12.5 Hz source therefore uses 13 frames for a one-second window.
+    return max(1, int(np.floor(duration_seconds * control_hz + 0.5)))
+
+
+def frames_for_stride(stride_seconds: float, control_hz: float) -> int:
+    """Convert a time stride to native frames without skipping extra windows."""
+    if stride_seconds <= 0:
+        raise ValueError(f"stride_seconds must be positive, got {stride_seconds}.")
+    if control_hz <= 0:
+        raise ValueError(f"control_hz must be positive, got {control_hz}.")
+    return max(1, int(np.floor(stride_seconds * control_hz)))
+
+
 def extract_action_window(
     actions: np.ndarray,
     *,

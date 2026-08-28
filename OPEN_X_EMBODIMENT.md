@@ -4,14 +4,13 @@
 
 ## 数据流
 
-RLDS trajectory 会先经过各数据集专用的 OXE standardization transform，统一为相对末端执行器动作；随后根据独立频率表将动作重采样到 `--target-control-hz`（默认 10 Hz），再按重采样后各数据集的 q01/q99 将非夹爪维度归一化到 `[-1, 1]`，夹爪维度保持原值；最后在线构造长度为 `--horizon` 的未来 action chunk。轨迹尾部不足的相对动作补零，绝对夹爪动作重复最后一个有效值。
+RLDS trajectory 会先经过各数据集专用的 OXE standardization transform，统一为相对末端执行器动作；动作始终保留数据集原生帧率，再按每个数据集原生 action 的 q01/q99 将非夹爪维度归一化到 `[-1, 1]`，夹爪维度保持原值。`--window-duration-seconds` 指定统一的物理时间窗，程序根据独立频率表换算每个数据集的窗口帧数。例如 1 秒窗口对 20 Hz 数据取 20 帧，对 10 Hz 数据取 10 帧，不再做上采样或下采样。
 
-重采样时，相对 XYZ/RPY delta 按源/目标时间区间的重叠比例拆分或累加，夹爪这种绝对量使用零阶保持。例如 20→10 Hz 会把相邻两步 relative delta 相加，5→10 Hz 会把一步 relative delta 平分为两步并重复夹爪状态。频率表位于 `scripts/action_vqvae/rlds/oxe/control_frequencies.py`；遇到没有已核实频率的新数据集会直接报错，不会猜测。
+轨迹尾部不足一个时间窗时，相对 XYZ/RPY 动作补零，绝对夹爪动作重复最后一个有效值。不同原生帧数的 chunk 仅在组成 batch 时中性补到当前 mixture 的最大帧数；effect 累计值不会因此改变，评估也会根据随样本保存的真实窗口帧数忽略这些 batch padding。频率表位于 `scripts/action_vqvae/rlds/oxe/control_frequencies.py`；遇到没有已核实频率的新数据集会直接报错，不会猜测。
 
 频率表记录的是数据集的标称控制率，因为 OXE 没有跨数据集统一、可靠的 step timestamp。OpenVLA 的 LIBERO `*_no_noops` 生成脚本会在调用下一次 20 Hz 仿真 step 前跳过 no-op，因此这里仍按 20 Hz 的时间压缩重放序列处理。
 
-窗口起点由 `--sampling-stride` 控制；省略或设为 `0` 时使用
-`max(1, horizon // 4)`，因此默认 `horizon=10` 时 stride 为 2。stride 只减少高度重叠的训练窗口，不改变窗口长度、控制频率和尾部填充规则。默认的 10 Hz × 10 步窗口覆盖约 1 秒。
+窗口起点由 `--sampling-stride-seconds` 控制，省略时使用窗口时长的四分之一。它也会按各数据集原生 Hz 换算成帧数；默认 1 秒窗口对应 0.25 秒 stride。对于无法整数表示的组合使用最接近的正整数帧数，例如 12.5 Hz 的 1 秒窗口取 13 帧。
 
 训练入口不会再做模型侧二次归一化。`DataLoader` 固定使用 `num_workers=0`，TFDS/DLimp 会自行管理并行读取。
 
@@ -45,9 +44,8 @@ python scripts/action_vqvae/train_action_vqvae.py \
   --data-root-dir /data/OpenX \
   --train-dataset-name my_openx_mix \
   --rlds-storage-format webdataset \
-  --target-control-hz 10 \
-  --horizon 10 \
-  --sampling-stride 2 \
+  --window-duration-seconds 1.0 \
+  --sampling-stride-seconds 0.25 \
   --action-dim 7 \
   --shuffle-buffer-size 50000 \
   --no-rlds-validation \
@@ -63,10 +61,10 @@ python scripts/action_vqvae/train_action_vqvae.py \
 
 同一个逻辑数据集如果同时具有 tar 和 TFDS 副本，`auto/hybrid` 默认只读取 tar，避免重复采样相同 episode；需要强制读取 TFDS 时使用 `--rlds-storage-format=tfds`。
 
-tar 第一次使用时会扫描每个数据集，计算 OXE standardizer 和 10 Hz 重采样之后的 action
+tar 第一次使用时会扫描每个数据集，计算 OXE standardizer 之后、原生帧率 action 的
 `mean/std/min/max/q01/q99`，并在 shard 旁缓存为 `dataset_statistics_<hash>.json`。之后会直接复用缓存。训练流仍然按照 mixture 权重抽样，并先填满 `--shuffle-buffer-size` 个 action chunk；快速测试时可将其设为 `1000`。
 
-频率和重采样算法版本已加入统计缓存 hash，旧的 native-rate q01/q99 不会被复用；首次启用 10 Hz 时会为每个数据集重新扫描一次并生成新的缓存文件。
+窗口时长不会改变逐帧 q01/q99，因此不同窗口时长可以复用同一个原生帧率统计缓存。
 
 tar 没有官方 validation split，因此本地读取器按排序后的 episode 固定使用前 95% 训练、后 5% 验证。设置 `--no-rlds-validation` 可关闭验证。
 

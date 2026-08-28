@@ -36,7 +36,6 @@ def make_oxe_dataset_kwargs(
     load_proprio: bool = True,
     load_language: bool = True,
     action_proprio_normalization_type: NormalizationType = NormalizationType.NORMAL,
-    target_control_hz: float | None = None,
 ) -> Dict[str, Any]:
     """Generates config (kwargs) for given dataset from Open-X Embodiment."""
     dataset_name = canonicalize_oxe_dataset_name(dataset_name)
@@ -64,11 +63,12 @@ def make_oxe_dataset_kwargs(
     dataset_kwargs["action_proprio_normalization_type"] = (
         action_proprio_normalization_type
     )
-    if target_control_hz is not None:
-        dataset_kwargs["source_control_hz"] = get_oxe_control_frequency_hz(
-            dataset_name
-        )
-        dataset_kwargs["target_control_hz"] = float(target_control_hz)
+    # Keep trajectories at their native rate. The action-only tokenizer uses
+    # this nominal frequency to convert a duration in seconds into a
+    # per-dataset number of frames; it must never resample the actions.
+    dataset_kwargs["source_control_hz"] = get_oxe_control_frequency_hz(
+        dataset_name
+    )
 
     # Adjust Loaded Camera Views
     if (
@@ -125,7 +125,6 @@ def get_oxe_dataset_kwargs_and_weights(
     load_proprio: bool = True,
     load_language: bool = True,
     action_proprio_normalization_type: NormalizationType = NormalizationType.NORMAL,
-    target_control_hz: float | None = None,
 ) -> Tuple[Dict[str, Any], List[float]]:
     """
     Generates dataset kwargs for a given dataset mix from the Open X-Embodiment dataset. The returned kwargs
@@ -164,7 +163,6 @@ def get_oxe_dataset_kwargs_and_weights(
                     load_proprio,
                     load_language,
                     action_proprio_normalization_type,
-                    target_control_hz,
                 )
             )
             sampling_weights.append(d_weight)

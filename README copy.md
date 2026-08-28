@@ -9,9 +9,9 @@
 
 1. 使用 OpenX/VQ-VLA 中每个数据集自己的 standardization transform，把动作统一为
    EEF delta XYZ、delta RPY 和绝对夹爪状态；
-2. 在计算统计量和 action chunk 之前重采样到 10 Hz；
+2. 保留每个数据集的原生帧率，并由频率表把统一时间窗换算为各自的帧数；
 3. 对每个数据集、每个动作维度只按照自己的 q01/q99 裁剪，不在数据集内部缩放；
-4. 形成固定长度 action chunk，尾部相对动作补零、绝对夹爪重复最后值；
+4. 形成固定时长 action chunk，尾部相对动作补零、绝对夹爪重复最后值；
 5. 计算 `sum(XYZ), sum(RPY), gripper[-1]-gripper[0]` 七维 effect；
 6. 将所有采样到的 effect 合并，用训练集的一套 pooled z-score 做统一标准化；
 7. 在标准化后的 effect 上执行普通 full-data Lloyd K-means。
@@ -45,7 +45,7 @@ bash scripts/train.sh
 bash scripts/eval.sh
 ```
 
-评估会从 checkpoint 读取训练时的 10 Hz、horizon、stride、全局 mean/std 等配置，避免
+评估会从 checkpoint 读取训练时的窗口秒数、stride 秒数和原生帧率约定，避免
 训练和评估预处理不一致。默认输出：
 
 - `summary.md` 和 `metrics.json`：held-out 聚类误差、R²、usage、perplexity、entropy、
@@ -53,8 +53,8 @@ bash scripts/eval.sh
 - `per_token_metrics.csv`：每个 token 的频率、簇内误差和原始单位中心；
 - `token_usage_polar.html`：可交互的极坐标 token 使用分布；
 - `token_trajectories/index.html`：每个 token 的可交互轨迹浏览器；
-- `trajectory_examples.npz`：绘图所用原始轨迹、均值轨迹、中心和计数。
+- `trajectory_examples.npz`：绘图所用原始轨迹、真实窗口长度、原生 Hz、中心和计数。
 
 每个 token 页面包含位置三维曲线、旋转三维曲线和夹爪二维曲线。蓝线是实际归入该
-token 的 held-out 原始轨迹，红线是这些轨迹的逐时刻均值。黑色虚线只表示 K-means
+token 的 held-out 原始轨迹，并使用各自真实帧数和原生 Hz。黑色虚线只表示 K-means
 中心对应的终点 effect；直接聚类没有 decoder，因此它不是模型生成的唯一轨迹。

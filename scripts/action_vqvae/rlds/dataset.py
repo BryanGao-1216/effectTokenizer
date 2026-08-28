@@ -17,10 +17,6 @@ import tensorflow_datasets as tfds
 
 from .logging_utils import initialize_overwatch
 from . import obs_transforms, traj_transforms
-from .frequency_resampling import (
-    CONTROL_FREQUENCY_RESAMPLER_VERSION,
-    resample_action_tensor,
-)
 from .utils import goal_relabeling, task_augmentation
 from .utils.data_utils import (
     NormalizationType,
@@ -55,7 +51,6 @@ def make_action_dataset_from_rlds(
     absolute_action_mask: Optional[List[bool]] = None,
     action_normalization_mask: Optional[List[bool]] = None,
     source_control_hz: Optional[float] = None,
-    target_control_hz: Optional[float] = None,
     num_parallel_reads: int = tf.data.AUTOTUNE,
     num_parallel_calls: int = tf.data.AUTOTUNE,
 ) -> Tuple[dl.DLataset, dict]:
@@ -95,6 +90,10 @@ def make_action_dataset_from_rlds(
             "action": tf.cast(traj["action"], tf.float32),
             "dataset_name": tf.repeat(name, traj_len),
         }
+        if source_control_hz is not None:
+            result["source_control_hz"] = tf.fill(
+                [traj_len], tf.cast(source_control_hz, tf.float32)
+            )
         if absolute_action_mask is not None:
             if len(absolute_action_mask) != result["action"].shape[-1]:
                 raise ValueError(
@@ -104,28 +103,6 @@ def make_action_dataset_from_rlds(
             result["absolute_action_mask"] = tf.tile(
                 tf.convert_to_tensor(absolute_action_mask, dtype=tf.bool)[None],
                 [traj_len, 1],
-            )
-        if target_control_hz is not None:
-            if source_control_hz is None:
-                raise ValueError(
-                    f"target_control_hz={target_control_hz} was requested for {name!r}, "
-                    "but source_control_hz is missing."
-                )
-            if absolute_action_mask is None:
-                raise ValueError(
-                    f"Control-frequency resampling for {name!r} requires absolute_action_mask."
-                )
-            result["action"] = resample_action_tensor(
-                result["action"],
-                absolute_action_mask=absolute_action_mask,
-                source_hz=source_control_hz,
-                target_hz=target_control_hz,
-            )
-            resampled_len = tf.shape(result["action"])[0]
-            result["dataset_name"] = tf.repeat(name, resampled_len)
-            result["absolute_action_mask"] = tf.tile(
-                tf.convert_to_tensor(absolute_action_mask, dtype=tf.bool)[None],
-                [resampled_len, 1],
             )
         return result
 
@@ -146,14 +123,6 @@ def make_action_dataset_from_rlds(
             str(state_obs_keys),
             inspect.getsource(standardize_fn) if standardize_fn is not None else "",
         ]
-        if target_control_hz is not None:
-            hash_dependencies.extend(
-                [
-                    CONTROL_FREQUENCY_RESAMPLER_VERSION,
-                    str(source_control_hz),
-                    str(target_control_hz),
-                ]
-            )
         dataset_statistics = get_dataset_statistics(
             full_dataset,
             hash_dependencies=tuple(hash_dependencies),
@@ -210,7 +179,6 @@ def make_dataset_from_rlds(
     absolute_action_mask: Optional[List[bool]] = None,
     action_normalization_mask: Optional[List[bool]] = None,
     source_control_hz: Optional[float] = None,
-    target_control_hz: Optional[float] = None,
     num_parallel_reads: int = tf.data.AUTOTUNE,
     num_parallel_calls: int = tf.data.AUTOTUNE,
 ) -> Tuple[dl.DLataset, dict]:
@@ -284,11 +252,6 @@ def make_dataset_from_rlds(
         - action                        # action vector
         - dataset_name                  # name of the dataset
     """
-    if target_control_hz is not None:
-        raise ValueError(
-            "Control-frequency resampling is only implemented for the action-only "
-            "VQ-VAE pipeline; resampling a VLA dataset also requires time-aligning observations."
-        )
     REQUIRED_KEYS = {"observation", "action"}
     if language_key is not None:
         REQUIRED_KEYS.add(language_key)
@@ -350,6 +313,10 @@ def make_dataset_from_rlds(
             "action": tf.cast(traj["action"], tf.float32),
             "dataset_name": tf.repeat(name, traj_len),
         }
+        if source_control_hz is not None:
+            traj["source_control_hz"] = tf.fill(
+                [traj_len], tf.cast(source_control_hz, tf.float32)
+            )
 
         if absolute_action_mask is not None:
             if len(absolute_action_mask) != traj["action"].shape[-1]:
@@ -425,6 +392,7 @@ def apply_trajectory_transforms(
     window_size: int = 1,
     future_action_window_size: int = 0,
     sampling_stride: int = 1,
+    output_action_window_size: Optional[int] = None,
     pad_incomplete_action_windows: bool = True,
     subsample_length: Optional[int] = None,
     skip_unlabeled: bool = False,
@@ -454,6 +422,9 @@ def apply_trajectory_transforms(
         future_action_window_size (int, optional): The number of future actions beyond window_size to include
             in the chunked actions.
         sampling_stride (int, optional): Keep one chunk start every this many trajectory steps after chunking.
+        output_action_window_size (int, optional): Pad native-rate action chunks to this many
+            frames for cross-dataset batching. The original native window length is retained in
+            ``action_window_length``.
         pad_incomplete_action_windows (bool, optional): If True, keep tail windows and pad relative
             actions with zero while repeating absolute actions. If False, drop windows that extend
             past the end of an episode.
@@ -536,6 +507,15 @@ def apply_trajectory_transforms(
             partial(
                 traj_transforms.drop_incomplete_action_windows,
                 future_action_window_size=future_action_window_size,
+            ),
+            num_parallel_calls,
+        )
+
+    if output_action_window_size is not None:
+        dataset = dataset.traj_map(
+            partial(
+                traj_transforms.pad_action_chunks,
+                output_action_window_size=output_action_window_size,
             ),
             num_parallel_calls,
         )
@@ -726,15 +706,32 @@ def make_interleaved_dataset(
     if primary_dataset_indices.size == 0:
         primary_dataset_indices = np.arange(len(sample_weights), dtype=np.int64)
 
-    # Balance and Normalize Weights
+    effective_dataset_sizes = np.asarray(dataset_sizes, dtype=np.float64)
+    for index, transform_kwargs in enumerate(
+        per_dataset_traj_transform_kwargs
+    ):
+        sampling_stride = int(transform_kwargs.get("sampling_stride", 1))
+        if sampling_stride <= 0:
+            raise ValueError(
+                f"Per-dataset sampling stride must be positive, got {sampling_stride}."
+            )
+        effective_dataset_sizes[index] = np.ceil(
+            effective_dataset_sizes[index] / sampling_stride
+        )
+
+    # Balance and Normalize Weights. For native-rate fixed-duration windows,
+    # use the number of retained window starts instead of raw transitions so
+    # higher-Hz datasets are not favored merely for containing more frames.
     if balance_weights:
-        sample_weights = np.array(sample_weights) * np.array(dataset_sizes)
+        sample_weights = np.array(sample_weights) * effective_dataset_sizes
     sample_weights = np.array(sample_weights) / np.sum(sample_weights)
     pprint_data_mixture(dataset_kwargs_list, sample_weights)
 
     # Effective Dataset Length = Number of samples until each dataset has completed at least one epoch
     #   =>> Note :: Only counting the "primary" datasets (i.e., datasets with sample_weight == 1.0)
-    dataset_len = int((np.array(dataset_sizes) / sample_weights)[primary_dataset_indices].max())
+    dataset_len = int(
+        (effective_dataset_sizes / sample_weights)[primary_dataset_indices].max()
+    )
 
     # Allocate Threads based on Weights
     threads_per_dataset = allocate_threads(traj_transform_threads, sample_weights)
@@ -807,6 +804,7 @@ def make_interleaved_action_dataset(
     train: bool,
     shuffle_buffer_size: int,
     traj_transform_kwargs: Optional[Dict] = None,
+    per_dataset_traj_transform_kwargs: Optional[List[Dict]] = None,
     batch_size: Optional[int] = None,
     balance_weights: bool = False,
     traj_transform_threads: Optional[int] = None,
@@ -826,6 +824,8 @@ def make_interleaved_action_dataset(
         shuffle_buffer_size: size of the dataset shuffle buffer (in number of frames).
         traj_transform_kwargs: kwargs passed to `apply_trajectory_transforms`. "num_parallel_calls" is
             overridden using `traj_transform_threads`.
+        per_dataset_traj_transform_kwargs: optional list of per-dataset overrides for
+            ``traj_transform_kwargs``. This is used for native-rate, fixed-duration windows.
         batch_size: batch size, if not provided output is not batched.
         balance_weights: if True, the sample weights are multiplied by the number of frames in each dataset.
             This makes it so that, if all the sample weights are equal, one full iteration through the interleaved
@@ -848,6 +848,15 @@ def make_interleaved_action_dataset(
     # Check valid `traj_transform_kwargs`。
     if traj_transform_kwargs is None:
         raise ValueError("Missing `traj_transform_kwargs`!")
+    if per_dataset_traj_transform_kwargs is None:
+        per_dataset_traj_transform_kwargs = [
+            {} for _ in dataset_kwargs_list
+        ]
+    if len(per_dataset_traj_transform_kwargs) != len(dataset_kwargs_list):
+        raise ValueError(
+            "per_dataset_traj_transform_kwargs must have length "
+            f"{len(dataset_kwargs_list)}"
+        )
 
     # Get Dataset Sizes
     dataset_sizes, all_dataset_statistics = [], {}
@@ -889,10 +898,12 @@ def make_interleaved_action_dataset(
     # Construct Datasets
     overwatch.info("Constructing datasets...")
     datasets = []
-    for dataset_kwargs, threads, reads in zip(
+    for dataset_kwargs, threads, reads, transform_overrides in zip(
         dataset_kwargs_list,
         threads_per_dataset,
         reads_per_dataset,
+        per_dataset_traj_transform_kwargs,
+        strict=True,
     ):
         if "dataset_frame_transform_kwargs" in dataset_kwargs:
             dataset_kwargs.pop("dataset_frame_transform_kwargs")
@@ -912,9 +923,13 @@ def make_interleaved_action_dataset(
                 num_parallel_reads=reads,
                 dataset_statistics=all_dataset_statistics[dataset_kwargs["name"]],
             )
+        dataset_transform_kwargs = {
+            **traj_transform_kwargs,
+            **transform_overrides,
+        }
         dataset = apply_trajectory_transforms(
             dataset.repeat(),
-            **traj_transform_kwargs,
+            **dataset_transform_kwargs,
             num_parallel_calls=threads,
             train=train,
             only_action=only_action,

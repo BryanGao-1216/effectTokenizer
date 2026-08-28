@@ -63,40 +63,6 @@ def test_openx_tar_stream_and_statistics_cache(tmp_path):
     assert len(list(source_dir.glob("dataset_statistics_*.json"))) == 1
 
 
-def test_openx_tar_statistics_apply_frequency_transform_before_caching(tmp_path):
-    source_dir = tmp_path / "toy_resampled"
-    source_dir.mkdir()
-    tar_path = source_dir / "toy_00000.tar"
-    _write_episode_tar(
-        tar_path,
-        {
-            "steps": [
-                {"action": np.array([1.0, 0.0], dtype=np.float32)},
-                {"action": np.array([2.0, 1.0], dtype=np.float32)},
-                {"action": np.array([3.0, 1.0], dtype=np.float32)},
-                {"action": np.array([4.0, 0.0], dtype=np.float32)},
-            ]
-        },
-    )
-
-    class FakeTensorFlow:
-        string = "string"
-
-        @staticmethod
-        def convert_to_tensor(value, dtype=None):
-            return np.asarray(value, dtype=object if dtype == "string" else None)
-
-    statistics = load_or_compute_openx_action_statistics(
-        paths=(tar_path,),
-        tf=FakeTensorFlow,
-        standardize_fn=lambda value: value,
-        hash_dependencies=("toy-resampled",),
-        action_transform=lambda action: action.reshape(2, 2, 2).sum(axis=1),
-    )
-    assert statistics["num_transitions"] == 2
-    assert statistics["action"]["mean"] == [5.0, 1.0]
-
-
 def test_auto_storage_mixes_tar_and_tfds_at_chunk_level(monkeypatch, tmp_path):
     try:
         import tensorflow_graphics  # noqa: F401
@@ -161,6 +127,8 @@ def test_auto_storage_mixes_tar_and_tfds_at_chunk_level(monkeypatch, tmp_path):
     bridge_dataset = object.__new__(module.OXEActionDataset)
     bridge_dataset.data_root_dir = tmp_path
     bridge_dataset._webdataset_sources = []
+    bridge_dataset.window_frames_by_name = {"bridge_orig": 5}
+    bridge_dataset.stride_frames_by_name = {"bridge_orig": 1}
     bridge_dataset._initialize_webdataset(
         [
             {
@@ -168,6 +136,7 @@ def test_auto_storage_mixes_tar_and_tfds_at_chunk_level(monkeypatch, tmp_path):
                 "standardize_fn": module.OXE_STANDARDIZATION_TRANSFORMS["bridge_orig"],
                 "action_normalization_mask": [True] * 6 + [False],
                 "absolute_action_mask": [False] * 6 + [True],
+                "source_control_hz": 5.0,
             }
         ],
         [1.0],
@@ -206,8 +175,8 @@ def test_auto_storage_mixes_tar_and_tfds_at_chunk_level(monkeypatch, tmp_path):
     mixture = [("tar_source", 1.0), ("tfds_source", 1.0)]
     monkeypatch.setattr(module, "OXE_NAMED_MIXTURES", {"toy_hybrid": mixture})
     per_dataset_kwargs = [
-        {"name": "tar_source"},
-        {"name": "tfds_source"},
+        {"name": "tar_source", "source_control_hz": 10.0},
+        {"name": "tfds_source", "source_control_hz": 20.0},
     ]
     monkeypatch.setattr(
         module,
@@ -242,7 +211,11 @@ def test_auto_storage_mixes_tar_and_tfds_at_chunk_level(monkeypatch, tmp_path):
     class FakeTFDSDataset:
         def as_numpy_iterator(self):
             yield from itertools.repeat(
-                {"action": np.full((16, 7), 2.0, dtype=np.float32)}
+                {
+                    "action": np.full((20, 7), 2.0, dtype=np.float32),
+                    "action_window_length": np.int64(20),
+                    "source_control_hz": np.float32(20.0),
+                }
             )
 
     def fake_make_tfds(**kwargs):
@@ -254,7 +227,8 @@ def test_auto_storage_mixes_tar_and_tfds_at_chunk_level(monkeypatch, tmp_path):
     dataset = module.OXEActionDataset(
         tmp_path,
         "toy_hybrid",
-        horizon=16,
+        window_duration_seconds=1.0,
+        sampling_stride_seconds=0.25,
         action_dim=7,
         train=False,
         shuffle_buffer_size=32,
@@ -263,11 +237,18 @@ def test_auto_storage_mixes_tar_and_tfds_at_chunk_level(monkeypatch, tmp_path):
         seed=7,
     )
     dataset._iter_weighted_webdataset_chunks = lambda: iter(
-        itertools.repeat(np.full((16, 7), 1.0, dtype=np.float32))
+        itertools.repeat(
+            (
+                np.full((20, 7), 1.0, dtype=np.float32),
+                10,
+                10.0,
+            )
+        )
     )
 
     chunks = list(dataset._iter_hybrid_chunks())
     assert dataset.storage_format == "hybrid"
     assert np.array_equal(dataset._hybrid_backend_weights, [0.5, 0.5])
     assert len(chunks) == 32
-    assert {float(chunk[0, 0]) for chunk in chunks} == {1.0, 2.0}
+    assert {float(chunk[0][0, 0]) for chunk in chunks} == {1.0, 2.0}
+    assert {chunk[1] for chunk in chunks} == {10, 20}

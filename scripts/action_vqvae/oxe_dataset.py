@@ -19,12 +19,12 @@ from torch import Tensor
 from torch.utils.data import IterableDataset, get_worker_info
 
 if __package__:
-    from .action_window import extract_action_window
-    from .rlds import make_interleaved_action_dataset
-    from .rlds.frequency_resampling import (
-        CONTROL_FREQUENCY_RESAMPLER_VERSION,
-        resample_action_numpy,
+    from .action_window import (
+        extract_action_window,
+        frames_for_duration,
+        frames_for_stride,
     )
+    from .rlds import make_interleaved_action_dataset
     from .rlds.oxe import (
         OXE_NAMED_MIXTURES,
         get_oxe_dataset_kwargs_and_weights,
@@ -40,12 +40,12 @@ if __package__:
         transform_openx_tar_episode,
     )
 else:  # Support direct execution of train_action_vqvae.py.
-    from action_window import extract_action_window
-    from rlds import make_interleaved_action_dataset
-    from rlds.frequency_resampling import (
-        CONTROL_FREQUENCY_RESAMPLER_VERSION,
-        resample_action_numpy,
+    from action_window import (
+        extract_action_window,
+        frames_for_duration,
+        frames_for_stride,
     )
+    from rlds import make_interleaved_action_dataset
     from rlds.oxe import (
         OXE_NAMED_MIXTURES,
         get_oxe_dataset_kwargs_and_weights,
@@ -62,18 +62,17 @@ else:  # Support direct execution of train_action_vqvae.py.
     )
 
 
-class OXEActionDataset(IterableDataset[tuple[Tensor]]):
-    """Stream normalized action chunks from one OXE dataset or a named mix."""
+class OXEActionDataset(IterableDataset[tuple[Tensor, Tensor, Tensor]]):
+    """Stream native-rate, fixed-duration normalized OXE action chunks."""
 
     def __init__(
         self,
         data_root_dir: str | Path,
         data_mix: str,
         *,
-        horizon: int,
-        sampling_stride: int | None = None,
+        window_duration_seconds: float,
+        sampling_stride_seconds: float | None = None,
         pad_incomplete_windows: bool = True,
-        target_control_hz: float | None = None,
         action_dim: int = 7,
         train: bool = True,
         shuffle_buffer_size: int = 200_000,
@@ -85,19 +84,19 @@ class OXEActionDataset(IterableDataset[tuple[Tensor]]):
         seed: int = 0,
     ) -> None:
         super().__init__()
-        if horizon <= 0:
-            raise ValueError(f"horizon must be positive, got {horizon}")
+        if window_duration_seconds <= 0:
+            raise ValueError(
+                "window_duration_seconds must be positive, got "
+                f"{window_duration_seconds}"
+            )
         if action_dim <= 0:
             raise ValueError(f"action_dim must be positive, got {action_dim}")
-        if sampling_stride is None:
-            sampling_stride = max(1, horizon // 4)
-        if sampling_stride <= 0:
+        if sampling_stride_seconds is None:
+            sampling_stride_seconds = window_duration_seconds / 4.0
+        if sampling_stride_seconds <= 0:
             raise ValueError(
-                f"sampling_stride must be positive, got {sampling_stride}"
-            )
-        if target_control_hz is not None and target_control_hz <= 0:
-            raise ValueError(
-                f"target_control_hz must be positive or None, got {target_control_hz}"
+                "sampling_stride_seconds must be positive, got "
+                f"{sampling_stride_seconds}"
             )
         if shuffle_buffer_size <= 0:
             raise ValueError("shuffle_buffer_size must be positive")
@@ -111,12 +110,9 @@ class OXEActionDataset(IterableDataset[tuple[Tensor]]):
 
         self.data_root_dir = Path(data_root_dir)
         self.data_mix = data_mix
-        self.horizon = int(horizon)
-        self.sampling_stride = int(sampling_stride)
+        self.window_duration_seconds = float(window_duration_seconds)
+        self.sampling_stride_seconds = float(sampling_stride_seconds)
         self.pad_incomplete_windows = bool(pad_incomplete_windows)
-        self.target_control_hz = (
-            None if target_control_hz is None else float(target_control_hz)
-        )
         self.action_dim = int(action_dim)
         self.train = bool(train)
         self.sample_ratio = float(sample_ratio)
@@ -144,31 +140,43 @@ class OXEActionDataset(IterableDataset[tuple[Tensor]]):
             load_proprio=False,
             load_language=False,
             action_proprio_normalization_type=NormalizationType.BOUNDS_Q99,
-            target_control_hz=self.target_control_hz,
         )
         if not per_dataset_kwargs:
             raise ValueError(
                 f"No supported EEF action datasets remain in mixture {data_mix!r}"
             )
 
-        if self.target_control_hz is not None:
+        self.window_frames_by_name = {
+            item["name"]: frames_for_duration(
+                self.window_duration_seconds,
+                float(item["source_control_hz"]),
+            )
+            for item in per_dataset_kwargs
+        }
+        self.stride_frames_by_name = {
+            item["name"]: frames_for_stride(
+                self.sampling_stride_seconds,
+                float(item["source_control_hz"]),
+            )
+            for item in per_dataset_kwargs
+        }
+        self.output_action_window_size = max(self.window_frames_by_name.values())
+        print(
+            "[data] native-rate time-window plan: "
+            f"duration={self.window_duration_seconds:g}s "
+            f"stride={self.sampling_stride_seconds:g}s "
+            f"batch_frames={self.output_action_window_size}",
+            flush=True,
+        )
+        for item in per_dataset_kwargs:
+            name = item["name"]
+            source_hz = float(item["source_control_hz"])
             print(
-                f"[data] control-frequency plan: target={self.target_control_hz:g}Hz",
+                f"[data]   {name}: {source_hz:g}Hz, "
+                f"window={self.window_frames_by_name[name]} frames, "
+                f"stride={self.stride_frames_by_name[name]} frames",
                 flush=True,
             )
-            for item in per_dataset_kwargs:
-                source_hz = float(item["source_control_hz"])
-                if np.isclose(source_hz, self.target_control_hz):
-                    mode = "unchanged"
-                elif source_hz > self.target_control_hz:
-                    mode = "downsample"
-                else:
-                    mode = "upsample"
-                print(
-                    f"[data]   {item['name']}: {source_hz:g}Hz -> "
-                    f"{self.target_control_hz:g}Hz ({mode})",
-                    flush=True,
-                )
         self.dataset_names = tuple(item["name"] for item in per_dataset_kwargs)
         self.source_control_frequencies = {
             item["name"]: float(item["source_control_hz"])
@@ -247,12 +255,23 @@ class OXEActionDataset(IterableDataset[tuple[Tensor]]):
                 shuffle_buffer_size=shuffle_buffer_size,
                 traj_transform_kwargs={
                     "window_size": 1,
-                    "future_action_window_size": self.horizon - 1,
-                    "sampling_stride": self.sampling_stride,
                     "pad_incomplete_action_windows": self.pad_incomplete_windows,
                     "skip_unlabeled": False,
                     "goal_relabeling_strategy": None,
                 },
+                per_dataset_traj_transform_kwargs=[
+                    {
+                        "future_action_window_size": self.window_frames_by_name[
+                            item["name"]
+                        ]
+                        - 1,
+                        "sampling_stride": self.stride_frames_by_name[
+                            item["name"]
+                        ],
+                        "output_action_window_size": self.output_action_window_size,
+                    }
+                    for item in tfds_kwargs
+                ],
                 balance_weights=balance_weights,
                 traj_transform_threads=(
                     traj_transform_threads
@@ -282,11 +301,19 @@ class OXEActionDataset(IterableDataset[tuple[Tensor]]):
             [dataset_sizes_by_name[name] for name in self.dataset_names],
             dtype=np.float64,
         )
-        sampled_dataset_sizes = np.ceil(dataset_sizes / self.sampling_stride)
+        stride_frames = np.asarray(
+            [self.stride_frames_by_name[name] for name in self.dataset_names],
+            dtype=np.float64,
+        )
+        sampled_dataset_sizes = np.ceil(dataset_sizes / stride_frames)
         base_weights = np.asarray(weights, dtype=np.float64)
         effective_weights = base_weights.copy()
         if balance_weights:
-            effective_weights *= dataset_sizes
+            # Balance by the number of fixed-duration window starts rather
+            # than native transitions. Otherwise a 20 Hz source would receive
+            # roughly twice the weight of a 10 Hz source solely for having
+            # twice as many frames per second.
+            effective_weights *= sampled_dataset_sizes
         effective_weights /= effective_weights.sum()
         self.sample_weights = effective_weights
 
@@ -349,8 +376,7 @@ class OXEActionDataset(IterableDataset[tuple[Tensor]]):
             name = kwargs["name"]
             paths = resolve_openx_tar_paths(self.data_root_dir, name)
             standardize_fn = kwargs["standardize_fn"]
-            source_control_hz = kwargs.get("source_control_hz")
-            target_control_hz = kwargs.get("target_control_hz")
+            source_control_hz = float(kwargs["source_control_hz"])
             absolute_action_mask = np.asarray(
                 kwargs["absolute_action_mask"], dtype=bool
             )
@@ -369,32 +395,11 @@ class OXEActionDataset(IterableDataset[tuple[Tensor]]):
                 repr(openx_tar_manifest(paths)),
                 inspect.getsource(standardize_fn),
             ]
-            if target_control_hz is not None:
-                hash_dependencies.extend(
-                    [
-                        CONTROL_FREQUENCY_RESAMPLER_VERSION,
-                        str(source_control_hz),
-                        str(target_control_hz),
-                    ]
-                )
             statistics = load_or_compute_openx_action_statistics(
                 paths=paths,
                 tf=tf,
                 standardize_fn=standardize_fn,
                 hash_dependencies=tuple(hash_dependencies),
-                action_transform=(
-                    None
-                    if target_control_hz is None
-                    else lambda action,
-                    absolute_action_mask=absolute_action_mask,
-                    source_control_hz=source_control_hz,
-                    target_control_hz=target_control_hz: resample_action_numpy(
-                        action,
-                        absolute_action_mask=absolute_action_mask,
-                        source_hz=source_control_hz,
-                        target_hz=target_control_hz,
-                    )
-                ),
             )
             statistics = {
                 **statistics,
@@ -421,7 +426,8 @@ class OXEActionDataset(IterableDataset[tuple[Tensor]]):
                     "standardize_fn": standardize_fn,
                     "absolute_action_mask": absolute_action_mask,
                     "source_control_hz": source_control_hz,
-                    "target_control_hz": target_control_hz,
+                    "window_frames": self.window_frames_by_name[name],
+                    "stride_frames": self.stride_frames_by_name[name],
                     "statistics": statistics,
                 }
             )
@@ -436,7 +442,7 @@ class OXEActionDataset(IterableDataset[tuple[Tensor]]):
 
     def _iter_webdataset_source(
         self, source: dict[str, Any], source_index: int
-    ) -> Iterator[np.ndarray]:
+    ) -> Iterator[tuple[np.ndarray, int, float]]:
         import tensorflow as tf
 
         statistics = source["statistics"]["action"]
@@ -464,13 +470,6 @@ class OXEActionDataset(IterableDataset[tuple[Tensor]]):
                     transform=source["standardize_fn"],
                 )
                 action = np.asarray(trajectory["action"], dtype=np.float32)
-                if source["target_control_hz"] is not None:
-                    action = resample_action_numpy(
-                        action,
-                        absolute_action_mask=absolute_action_mask,
-                        source_hz=source["source_control_hz"],
-                        target_hz=source["target_control_hz"],
-                    )
                 normalized = np.clip(
                     2.0 * (action - low) / (high - low + 1e-8) - 1.0, -1.0, 1.0
                 )
@@ -481,23 +480,44 @@ class OXEActionDataset(IterableDataset[tuple[Tensor]]):
                 frame_stop = (
                     normalized.shape[0]
                     if self.pad_incomplete_windows
-                    else max(normalized.shape[0] - self.horizon + 1, 0)
+                    else max(
+                        normalized.shape[0] - source["window_frames"] + 1,
+                        0,
+                    )
                 )
-                frame_indices = np.arange(0, frame_stop, self.sampling_stride)
+                frame_indices = np.arange(
+                    0,
+                    frame_stop,
+                    source["stride_frames"],
+                )
                 if self.train:
                     frame_rng.shuffle(frame_indices)
                 for frame_index in frame_indices:
                     chunk = extract_action_window(
                         normalized,
                         start=int(frame_index),
-                        horizon=self.horizon,
+                        horizon=source["window_frames"],
                         absolute_action_mask=absolute_action_mask,
                         pad_incomplete=self.pad_incomplete_windows,
                     )
                     if chunk is None:
                         continue
+                    if source["window_frames"] < self.output_action_window_size:
+                        chunk = extract_action_window(
+                            chunk,
+                            start=0,
+                            horizon=self.output_action_window_size,
+                            absolute_action_mask=absolute_action_mask,
+                            pad_incomplete=True,
+                        )
+                        if chunk is None:  # pragma: no cover - defensive contract
+                            raise RuntimeError("Failed to add batch-only action padding.")
                     yielded = True
-                    yield chunk
+                    yield (
+                        chunk,
+                        int(source["window_frames"]),
+                        float(source["source_control_hz"]),
+                    )
             if not yielded:
                 split = "train" if self.train else "validation"
                 raise ValueError(
@@ -505,7 +525,9 @@ class OXEActionDataset(IterableDataset[tuple[Tensor]]):
                 )
             epoch += 1
 
-    def _iter_weighted_webdataset_chunks(self) -> Iterator[np.ndarray]:
+    def _iter_weighted_webdataset_chunks(
+        self,
+    ) -> Iterator[tuple[np.ndarray, int, float]]:
         iterators = [
             iter(self._iter_webdataset_source(source, index))
             for index, source in enumerate(self._webdataset_sources)
@@ -519,22 +541,31 @@ class OXEActionDataset(IterableDataset[tuple[Tensor]]):
             if self.sample_ratio >= 1.0 or rng.random() < self.sample_ratio:
                 yield chunk
 
-    def _iter_tfds_chunks(self, *, repeat: bool = False) -> Iterator[np.ndarray]:
+    def _iter_tfds_chunks(
+        self, *, repeat: bool = False
+    ) -> Iterator[tuple[np.ndarray, int, float]]:
         if self._tfds_dataset is None:
             raise RuntimeError("The TFDS stream has not been initialized.")
         while True:
             yielded = False
             for batch in self._tfds_dataset.as_numpy_iterator():
                 yielded = True
-                yield np.asarray(batch["action"], dtype=np.float32)
+                yield (
+                    np.asarray(batch["action"], dtype=np.float32),
+                    int(np.asarray(batch["action_window_length"]).item()),
+                    float(np.asarray(batch["source_control_hz"]).item()),
+                )
             if not repeat:
                 return
             if not yielded:
                 raise ValueError("The TFDS/RLDS stream is empty.")
 
     def _shuffle_chunk_stream(
-        self, stream: Iterator[np.ndarray], *, description: str
-    ) -> Iterator[np.ndarray]:
+        self,
+        stream: Iterator[tuple[np.ndarray, int, float]],
+        *,
+        description: str,
+    ) -> Iterator[tuple[np.ndarray, int, float]]:
         rng = np.random.default_rng(self.seed + 91_003)
         if not self.train:
             # Match the existing DLimp validation path: repeat the held-out
@@ -565,20 +596,24 @@ class OXEActionDataset(IterableDataset[tuple[Tensor]]):
             buffer[index] = next(stream)
             yield chunk
 
-    def _iter_webdataset_chunks(self) -> Iterator[np.ndarray]:
+    def _iter_webdataset_chunks(
+        self,
+    ) -> Iterator[tuple[np.ndarray, int, float]]:
         yield from self._shuffle_chunk_stream(
             iter(self._iter_weighted_webdataset_chunks()),
             description="OpenX tar",
         )
 
-    def _iter_hybrid_chunks(self) -> Iterator[np.ndarray]:
+    def _iter_hybrid_chunks(
+        self,
+    ) -> Iterator[tuple[np.ndarray, int, float]]:
         backend_iterators = [
             iter(self._iter_weighted_webdataset_chunks()),
             iter(self._iter_tfds_chunks(repeat=True)),
         ]
         rng = np.random.default_rng(self.seed + 47_021)
 
-        def weighted_stream() -> Iterator[np.ndarray]:
+        def weighted_stream() -> Iterator[tuple[np.ndarray, int, float]]:
             while True:
                 backend_index = int(
                     rng.choice(len(backend_iterators), p=self._hybrid_backend_weights)
@@ -590,7 +625,7 @@ class OXEActionDataset(IterableDataset[tuple[Tensor]]):
             description="hybrid OXE",
         )
 
-    def __iter__(self) -> Iterator[tuple[Tensor]]:
+    def __iter__(self) -> Iterator[tuple[Tensor, Tensor, Tensor]]:
         worker = get_worker_info()
         if worker is not None:
             raise RuntimeError(
@@ -609,15 +644,27 @@ class OXEActionDataset(IterableDataset[tuple[Tensor]]):
             stream = self._iter_hybrid_chunks()
         else:
             stream = self._iter_tfds_chunks()
-        for index, actions in enumerate(stream):
+        for index, (actions, action_window_length, source_control_hz) in enumerate(
+            stream
+        ):
             if index % world_size != rank:
                 continue
             actions = np.asarray(actions, dtype=np.float32)
-            if actions.shape != (self.horizon, self.action_dim):
+            if actions.shape != (self.output_action_window_size, self.action_dim):
                 raise ValueError(
-                    f"Expected OXE action chunk shape {(self.horizon, self.action_dim)}, got {actions.shape}"
+                    "Expected OXE action chunk shape "
+                    f"{(self.output_action_window_size, self.action_dim)}, "
+                    f"got {actions.shape}"
                 )
-            yield (torch.from_numpy(actions.copy()),)
+            if not 0 < action_window_length <= self.output_action_window_size:
+                raise ValueError(
+                    f"Invalid native action window length {action_window_length}."
+                )
+            yield (
+                torch.from_numpy(actions.copy()),
+                torch.tensor(action_window_length, dtype=torch.int64),
+                torch.tensor(source_control_hz, dtype=torch.float32),
+            )
 
     def __len__(self) -> int:
         return self.dataset_length
@@ -627,9 +674,10 @@ class OXEActionDataset(IterableDataset[tuple[Tensor]]):
         split = "train" if self.train else "validation"
         return (
             f"rlds:{self.data_mix} storage={self.storage_format} split={split} datasets=[{datasets}] "
-            f"estimated_samples={self.dataset_length} horizon={self.horizon} "
-            f"target_control_hz={self.target_control_hz or 'native'} "
-            f"sampling_stride={self.sampling_stride} "
+            f"estimated_samples={self.dataset_length} "
+            f"window_duration_seconds={self.window_duration_seconds:g} "
+            f"sampling_stride_seconds={self.sampling_stride_seconds:g} "
+            f"batch_frames={self.output_action_window_size} "
             f"pad_incomplete_windows={self.pad_incomplete_windows} "
             f"action_dim={self.action_dim}"
         )
@@ -653,7 +701,12 @@ class OXEActionDataset(IterableDataset[tuple[Tensor]]):
                 )
                 if dataset_name in self.source_control_frequencies
                 else None,
-                "target_control_hz": self.target_control_hz,
+                "window_duration_seconds": self.window_duration_seconds,
+                "window_frames": self.window_frames_by_name[dataset_name],
+                "sampling_stride_seconds": self.sampling_stride_seconds,
+                "sampling_stride_frames": self.stride_frames_by_name[
+                    dataset_name
+                ],
                 "absolute_action_mask": self.absolute_action_masks[
                     dataset_name
                 ].tolist()

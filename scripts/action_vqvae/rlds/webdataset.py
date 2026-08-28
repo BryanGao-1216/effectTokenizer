@@ -215,7 +215,6 @@ def load_or_compute_openx_action_statistics(
     tf: Any,
     standardize_fn: Callable[[dict[str, Any]], Mapping[str, Any]],
     hash_dependencies: Sequence[str],
-    action_transform: Callable[[np.ndarray], np.ndarray] | None = None,
 ) -> dict[str, Any]:
     """Compute action mean/std/min/max/q01/q99 directly from tar episodes."""
     if not paths:
@@ -241,8 +240,6 @@ def load_or_compute_openx_action_statistics(
             payload, tf=tf, transform=standardize_fn
         )
         action = np.asarray(trajectory["action"], dtype=np.float32)
-        if action_transform is not None:
-            action = np.asarray(action_transform(action), dtype=np.float32)
         if action.ndim != 2:
             raise ValueError(
                 f"OXE standardizer must produce rank-2 actions, got {action.shape}."
