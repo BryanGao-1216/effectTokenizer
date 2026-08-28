@@ -25,7 +25,7 @@ python scripts/effect_tokenizer/train_effect_tokenizer.py \
     --hidden-dim 128 \
     --latent-dim 16 \
     --num-hidden-layers 2 \
-    --codebook-size 256 \
+    --codebook-size 1024 \
     --gripper-weight 1.0 \
     --effect-motion-scale 0.1 \
     --codebook-loss-weight 1.0 \
